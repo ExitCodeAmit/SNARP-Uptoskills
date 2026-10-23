@@ -2,7 +2,7 @@
 
 An UptoSkills internship MVP where students and researchers share updates, publish research and connect with communities.
 
-This README describes the project **as it stands today**: what works end to end, what is UI only, and how to run it.
+This README describes the project **as it stands today**: what works end to end, what is UI only, and how to run for it.
 
 ---
 
