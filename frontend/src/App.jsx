@@ -24,6 +24,7 @@ import {
   Settings,
   Help,
   Search,
+  ChatPanel,
 } from './pages'
 
 // Load the landing page only when required
@@ -93,6 +94,7 @@ export default function App() {
             <Route path="/articles" element={<Articles />} />
             <Route path="/events" element={<Events />} />
             <Route path="/messages" element={<Messages />} />
+            <Route path="/chat" element={<ChatPanel />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/tools" element={<Tools />} />
             <Route path="/submit" element={<Submit user={user} />} />
