@@ -25,7 +25,7 @@ Complete step-by-step guide to install **PostgreSQL**, set up **pgAdmin 4**, cre
 | Requirement    | Details                                              |
 | -------------- | ---------------------------------------------------- |
 | **OS**         | Windows 10/11 (64-bit)                               |
-| **Node.js**    | v22 or later (`node --version` to check)             |
+| **Node.js**    | v22.12 or later (`node --version` to check)             |
 | **Disk Space** | ~500 MB for PostgreSQL + pgAdmin 4                   |
 | **Port**       | `5432` (default PostgreSQL port) must be free         |
 
@@ -225,6 +225,7 @@ PGPORT=5432
 PGUSER=postgres
 PGPASSWORD=your_actual_password_here
 PGDATABASE=snarp
+PGPOOL_MAX=10
 
 # Server Port
 PORT=5000
@@ -232,8 +233,11 @@ PORT=5000
 # Max PDF upload size in bytes (default 10 MB)
 PAPER_MAX_PDF_BYTES=10485760
 
-# JWT Secret — leave empty on first run, the server auto-generates one
+# Local development may leave JWT_SECRET unset; production must provide a unique secret of at least 32 bytes.
 # JWT_SECRET=
+
+# Only configure behind a trusted reverse proxy: hop count or trusted proxy IP/CIDRs.
+# TRUST_PROXY=
 ```
 
 > [!CAUTION]
@@ -250,7 +254,9 @@ PAPER_MAX_PDF_BYTES=10485760
 | `PGDATABASE`          | Database name for the SNARP project             | `snarp`     |
 | `PORT`                | Express API server port                         | `5000`      |
 | `PAPER_MAX_PDF_BYTES` | Maximum PDF upload size in bytes                | `10485760`  |
-| `JWT_SECRET`          | Secret key for JWT tokens (auto-generated)      | *(auto)*    |
+| `PGPOOL_MAX`          | Maximum PostgreSQL connections per backend process | `10`      |
+| `JWT_SECRET`          | Required production secret (at least 32 bytes); generated locally if unset | *(auto locally)* |
+| `TRUST_PROXY`         | Trusted proxy hop count or comma-separated proxy IPs/CIDRs | *(unset)* |
 
 ---
 
@@ -276,12 +282,13 @@ The server's `setupDb()` function automatically:
 1. **Connects** to the default `postgres` database.
 2. **Checks** if a database named `snarp` exists.
 3. **Creates** the `snarp` database if it doesn't exist.
-4. **Creates** all required tables and indexes:
+4. **Applies** ordered migrations `001` through `007`, creating and upgrading all feature tables and indexes. Applied versions are recorded in `schema_migrations`.
    - `users` — User accounts with roles (admin, moderator, author, user)
+   - `auth_sessions` — Active and revoked login sessions
    - `images` — Post images stored as BYTEA
    - `posts` — Social-style posts with optional images
    - `papers` — Research paper submissions with PDF storage
-5. **Generates** a `JWT_SECRET` and appends it to `.env` (if not already set).
+5. **In local development only**, generates a `JWT_SECRET` and appends it to `.env` if not already set. Production must provide its secret through environment configuration or a secret manager.
 
 Expected console output:
 ```
@@ -310,10 +317,13 @@ After the backend has run at least once:
 
    | Table      | Description                           |
    | ---------- | ------------------------------------- |
-   | `users`    | Registered user accounts              |
-   | `images`   | Post image binary data                |
-   | `posts`    | Social feed posts                     |
-   | `papers`   | Research paper submissions            |
+   | `users`, `user_profiles`, `auth_sessions` | Accounts and profiles |
+   | `images`, `posts`, `likes`, `comments`, `reports` | Feed content and interactions |
+   | `papers`, `paper_reviews`, `audit_logs` | Research and moderation history |
+   | `communities`, `community_members`, `community_posts` | Community discussions |
+   | `conversations`, `conversation_members`, `messages`, `notifications` | Messaging and alerts |
+   | `events`, `event_registrations` | Events and registrations |
+   | `schema_migrations` | Applied migrations |
 
 4. Right-click any table → **View/Edit Data** → **All Rows** to inspect its contents.
 
@@ -327,7 +337,7 @@ After the backend has run at least once:
    FROM information_schema.tables
    WHERE table_schema = 'public';
    ```
-4. You should see: `users`, `images`, `posts`, `papers`.
+4. You should see the current feature tables for accounts, feed interactions, papers and reviews, communities, messaging, notifications, events, and `schema_migrations`.
 
 ---
 
@@ -345,6 +355,19 @@ CREATE TABLE users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+### `auth_sessions`
+```sql
+CREATE TABLE auth_sessions (
+  id         UUID PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ
+);
+```
+
+The next migration creates `user_profiles`, `likes`, `comments`, and `reports`, and adds `updated_at` to `posts`. These social tables reference their owner and post with cascading foreign keys; likes and reports have per-user uniqueness constraints.
 
 ### `images`
 ```sql
@@ -484,7 +507,7 @@ Then kill the conflicting process or change `PGPORT` in `.env` to another port (
 - [ ] `backend/.env` file configured with correct `PGPASSWORD`
 - [ ] `npm install` completed in the `backend/` folder
 - [ ] `npm run dev` runs without errors
-- [ ] Tables (`users`, `images`, `posts`, `papers`) visible in pgAdmin
+- [ ] Current tables, including communities, messaging, notifications, events, and `schema_migrations`, visible in pgAdmin
 - [ ] API accessible at `http://localhost:5000`
 
 ---

@@ -13,8 +13,10 @@ import Feed from './Feed'
 
 import {
   Communities,
+  CommunityDetail,
   Articles,
   Events,
+  EventDetail,
   Messages,
   Notifications,
   Tools,
@@ -24,6 +26,8 @@ import {
   Settings,
   Help,
   Search,
+  UserProfile,
+  PaperDetail,
 } from './pages'
 
 // Load the landing page only when required
@@ -56,7 +60,12 @@ export default function App() {
   }
 
   // Log out the current user
-  const logout = () => {
+  const logout = async () => {
+    try {
+      await api('/auth/logout', { method: 'POST' })
+    } catch {
+      // Clear the browser session even if the API cannot be reached.
+    }
     clearToken()
     setUser(null)
   }
@@ -90,9 +99,12 @@ export default function App() {
             />
 
             <Route path="/communities" element={<Communities />} />
+            <Route path="/communities/:id" element={<CommunityDetail user={user} />} />
             <Route path="/articles" element={<Articles />} />
-            <Route path="/events" element={<Events />} />
-            <Route path="/messages" element={<Messages />} />
+            <Route path="/articles/:id" element={<PaperDetail />} />
+            <Route path="/events" element={<Events user={user} />} />
+            <Route path="/events/:id" element={<EventDetail user={user} />} />
+            <Route path="/messages" element={<Messages user={user} />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/tools" element={<Tools />} />
             <Route path="/submit" element={<Submit user={user} />} />
@@ -101,11 +113,12 @@ export default function App() {
 
             <Route
               path="/settings"
-              element={<Settings user={user} />}
+              element={<Settings user={user} onUserUpdate={setUser} />}
             />
 
             <Route path="/help" element={<Help />} />
             <Route path="/search" element={<Search />} />
+            <Route path="/users/:id" element={<UserProfile />} />
           </Route>
         ) : (
           // Landing page for logged-out visitors

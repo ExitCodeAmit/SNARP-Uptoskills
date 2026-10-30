@@ -40,7 +40,7 @@ export default function Auth({ mode, onAuth }) {
     try {
       const body = isSignup
         ? { name: form.name, email: form.email, password: form.password, role: form.role }
-        : { email: form.email, password: form.password }
+        : { email: form.email, password: form.password, remember: form.remember }
       onAuth(await api(`/auth/${mode}`, { method: 'POST', body }), isSignup || form.remember)
     } catch (err) {
       setServerError(err.message)
