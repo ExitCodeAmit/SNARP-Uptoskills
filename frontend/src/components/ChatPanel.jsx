@@ -15,21 +15,27 @@ function ChatPanel({ initialSession }) {
         setMessages(msgs)
         setLoading(false)
       })
-    } else {
-      setMessages([])
-      setLoading(false)
     }
   }, [sessionId])
 
   const send = async (e) => {
     e.preventDefault()
     if (!draft.trim()) return
+    
+    // Save user message first
     await api('/chat', {
       method: 'POST',
       body: { sessionId, role: 'user', content: draft.trim() },
     })
+    
+    // Get AI response
+    const result = await api('/chat/ai', {
+      method: 'POST',
+      body: { message: draft.trim() },
+    })
+    
     setDraft('')
-    if (sessionId) {
+    if (result.response) {
       api(`/chat/${sessionId}`).then((msgs) => setMessages(msgs))
     }
   }

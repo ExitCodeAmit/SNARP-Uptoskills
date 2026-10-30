@@ -23,6 +23,7 @@ if (!process.env.JWT_SECRET) {
   console.log('Generated JWT_SECRET in backend/.env')
 }
 const JWT_SECRET = process.env.JWT_SECRET
+const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
 
 // Creates the database and tables on first run; no-op when they already exist
 async function setupDb() {
@@ -442,6 +443,57 @@ app.get('/api/chat/:session', auth, async (req, res) => {
     [session]
   )
   res.json(rows)
+})
+
+app.post('/api/chat/ai', auth, async (req, res) => {
+  const { message } = req.body
+  if (!message || message.trim().length === 0) {
+    return res.status(400).json({ error: 'Message required' })
+  }
+
+  try {
+    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: 'You are a helpful research assistant for UptoSkills. Answer questions about academic research, papers, and student life.' },
+          { role: 'user', content: message }
+        ],
+        temperature: 0.7,
+        max_tokens: 1000,
+      }),
+    })
+
+    if (!groqResponse.ok) {
+      const errData = await groqResponse.json()
+      return res.status(500).json({ error: errData.error?.message || 'AI service error' })
+    }
+
+    const data = await groqResponse.json()
+    const aiResponse = data.choices[0].message.content.trim()
+    
+    // Save user message
+    await pool.query(
+      `INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, 'user', $3)`,
+      [req.sessionId || 1, req.userId, message.trim()]
+    )
+    
+    // Save AI response
+    await pool.query(
+      `INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, 'assistant', $3)`,
+      [req.sessionId || 1, req.userId, aiResponse]
+    )
+    
+    res.json({ response: aiResponse })
+  } catch (err) {
+    console.error('Groq error:', err)
+    res.status(500).json({ error: 'Failed to get AI response' })
+  }
 })
 
 // Public by unguessable UUID so <img> tags work without auth headers
