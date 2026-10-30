@@ -65,49 +65,6 @@ export const ARTICLES = [
   },
 ]
 
-export const EVENTS = [
-  { id: 1, day: '24', month: 'Oct', title: 'Writing Your First Research Paper', kind: 'Webinar', time: '5:00 PM IST', place: 'Online', going: 86 },
-  { id: 2, day: '02', month: 'Nov', title: 'UptoSkills Hack Week: Build for Education', kind: 'Hackathon', time: '10:00 AM IST', place: 'Palam, New Delhi', going: 140 },
-  { id: 3, day: '09', month: 'Nov', title: 'Peer Review Clinic for Authors', kind: 'Workshop', time: '4:00 PM IST', place: 'Online', going: 38 },
-  { id: 4, day: '21', month: 'Nov', title: 'Design Systems in Practice', kind: 'Talk', time: '6:30 PM IST', place: 'Online', going: 57 },
-]
-
-export const CONVERSATIONS = [
-  {
-    id: 1,
-    name: 'Dr. Asha Sen',
-    unread: 1,
-    messages: [
-      { mine: false, text: 'Hi! I read your draft on peer feedback loops.', time: '10:02 AM' },
-      { mine: true, text: 'Thank you for taking a look. Any major concerns?', time: '10:05 AM' },
-      { mine: false, text: 'Your peer review notes are ready. The methods section needs a clearer sampling description.', time: '10:11 AM' },
-    ],
-  },
-  {
-    id: 2,
-    name: 'Vikram Rao',
-    unread: 1,
-    messages: [{ mine: false, text: 'Welcome to the UI/UX community discussion board!', time: 'Yesterday' }],
-  },
-  {
-    id: 3,
-    name: 'Priya Menon',
-    unread: 0,
-    messages: [
-      { mine: true, text: 'Are you joining the hack week?', time: 'Mon' },
-      { mine: false, text: 'Yes, already registered. Want to team up?', time: 'Mon' },
-    ],
-  },
-]
-
-export const NOTIFICATIONS = [
-  { id: 1, kind: 'review', text: 'Your paper "Peer Feedback Loops" was accepted for review.', time: '25m ago', unread: true },
-  { id: 2, kind: 'like', text: 'Darlene Robertson liked your post.', time: '2h ago', unread: true },
-  { id: 3, kind: 'community', text: '12 new researchers joined the Creative community.', time: '5h ago', unread: true },
-  { id: 4, kind: 'event', text: 'Reminder: "Writing Your First Research Paper" starts in 2 days.', time: '1d ago', unread: false },
-  { id: 5, kind: 'comment', text: 'Rahul Das commented on your post.', time: '2d ago', unread: false },
-]
-
 export const MOD_QUEUE = [
   { id: 101, title: 'Edge Caching Strategies for Campus Networks', author: 'Ananya Joshi', domain: 'Systems', submitted: 'Oct 16, 2026', pages: 14 },
   { id: 102, title: 'Gamified Quizzes and Retention in Online Courses', author: 'Rohit Malhotra', domain: 'Education', submitted: 'Oct 15, 2026', pages: 9 },
