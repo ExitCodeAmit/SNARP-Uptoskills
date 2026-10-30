@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { Trash, Image as ImageIcon, X, ThumbsUp, ChatCircle, ShareFat, FilePdf } from '@phosphor-icons/react'
 import { api, apiBlob } from './api'
+import { SaveButton } from './Saved'
 import { Avatar } from './components/ui'
 import { ROLE_LABEL, timeAgo } from './format'
 import { COMMUNITIES, EVENTS } from './sample'
@@ -24,14 +25,14 @@ function FeedPaper({ paper }) {
     <p className="article-authors">{authors.join(', ')}</p>
     <p className="article-abstract">{paper.abstract}</p>
     <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
-    <div className="post-actions"><button onClick={openPdf}><FilePdf size={18} /> View paper</button></div>
+    <div className="post-actions"><button onClick={openPdf}><FilePdf size={18} /> View paper</button><SaveButton itemType="paper" itemId={paper.id} {...paper} /></div>
     {error && <p className="field-error" role="alert">{error}</p>}
     {pdfUrl && <div className="paper-pdf-preview"><button type="button" className="btn btn-ghost btn-sm" onClick={() => setPdfUrl('')}>Close PDF</button><iframe title={`PDF: ${paper.title}`} src={pdfUrl} /></div>}
   </>
 }
 
 // ponytail: like/comment/share are UI only; like toggles locally and is not saved
-function PostActions() {
+function PostActions({ post }) {
   const [liked, setLiked] = useState(false)
   return (
     <div className="post-actions">
@@ -40,6 +41,7 @@ function PostActions() {
       </button>
       <button><ChatCircle size={18} /> Comment</button>
       <button><ShareFat size={18} /> Share</button>
+      <SaveButton itemType="post" itemId={post.id} {...post} />
     </div>
   )
 }
@@ -221,7 +223,7 @@ export default function Feed({ user, onLogout }) {
                       loading="lazy"
                     />
                   )}
-                  <PostActions />
+                  <PostActions post={p} />
                 </div>
                 </>}
               </li>

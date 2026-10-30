@@ -9,6 +9,7 @@ import { Avatar, PageHeader } from '../components/ui'
 import { apa, bibtex } from '../cite'
 import { COMMUNITIES, EVENTS, CONVERSATIONS, NOTIFICATIONS, FAQ } from '../sample'
 import { api, apiBlob } from '../api'
+import { SaveButton } from '../Saved'
 
 function CopyButton({ text }) {
   const [done, setDone] = useState(false)
@@ -101,7 +102,7 @@ function PublishedPaperCard({ paper }) {
     <p className="article-authors">{authorNames.join(', ')}</p>
     <p className="article-abstract">{paper.abstract}</p>
     <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
-    <div className="article-actions"><PaperPdf paperId={paper.id} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
+    <div className="article-actions"><PaperPdf paperId={paper.id} /><SaveButton itemType="paper" itemId={paper.id} {...paper} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
   </article>
 }
 

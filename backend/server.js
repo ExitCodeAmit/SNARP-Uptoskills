@@ -91,7 +91,29 @@ async function setupDb() {
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-    CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);`)
+    CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);
+    CREATE TABLE IF NOT EXISTS save_folders (
+      id         SERIAL PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name       VARCHAR(80) NOT NULL,
+      is_default BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS save_folders_user_name_idx ON save_folders (user_id, lower(name));
+    CREATE UNIQUE INDEX IF NOT EXISTS save_folders_one_default_idx ON save_folders (user_id) WHERE is_default;
+    CREATE TABLE IF NOT EXISTS saved_items (
+      id         BIGSERIAL PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      folder_id  INTEGER NOT NULL REFERENCES save_folders(id) ON DELETE CASCADE,
+      post_id    INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+      paper_id   BIGINT REFERENCES papers(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK ((post_id IS NOT NULL AND paper_id IS NULL) OR (post_id IS NULL AND paper_id IS NOT NULL))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS saved_items_folder_post_idx ON saved_items (folder_id, post_id) WHERE post_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS saved_items_folder_paper_idx ON saved_items (folder_id, paper_id) WHERE paper_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS saved_items_user_created_idx ON saved_items (user_id, created_at DESC);`)
   return pool
 }
 
@@ -177,19 +199,46 @@ const POST_SELECT = `
   SELECT p.id, p.body, p.image_id, p.created_at, p.user_id, u.name AS author_name, u.role AS author_role
   FROM posts p JOIN users u ON u.id = p.user_id`
 
+async function ensureUnsortedFolder(userId) {
+  const { rows } = await pool.query(
+    `INSERT INTO save_folders (user_id, name, is_default) VALUES ($1, 'Unsorted', true)
+     ON CONFLICT (user_id) WHERE is_default DO UPDATE SET updated_at = save_folders.updated_at
+     RETURNING id, name, is_default`, [userId]
+  )
+  return rows[0]
+}
+
+const savedState = (table, idColumn = 'id') => {
+  const savedColumn = table === 'p' || table === 'posts' ? 'post_id' : 'paper_id'
+  return `
+  EXISTS (SELECT 1 FROM saved_items si JOIN save_folders sf ON sf.id = si.folder_id
+    WHERE si.user_id = $1 AND si.${savedColumn} = ${table}.${idColumn}) AS is_saved,
+  (SELECT si.folder_id FROM saved_items si JOIN save_folders sf ON sf.id = si.folder_id
+    WHERE si.user_id = $1 AND si.${savedColumn} = ${table}.${idColumn}
+    ORDER BY si.created_at DESC LIMIT 1) AS saved_folder_id,
+  (SELECT sf.name FROM saved_items si JOIN save_folders sf ON sf.id = si.folder_id
+    WHERE si.user_id = $1 AND si.${savedColumn} = ${table}.${idColumn}
+    ORDER BY si.created_at DESC LIMIT 1) AS saved_folder_name,
+  (SELECT si.id FROM saved_items si WHERE si.user_id = $1 AND si.${savedColumn} = ${table}.${idColumn}
+    ORDER BY si.created_at DESC LIMIT 1) AS saved_item_id`
+}
+
 // Mixed feed: social posts plus approved papers, newest first. Paper metadata is always read from PostgreSQL.
 app.get('/api/posts', auth, async (req, res) => {
+  await ensureUnsortedFolder(req.userId)
   const { rows } = await pool.query(`
     SELECT * FROM (
       SELECT 'post'::text AS type, p.id::text AS id, p.body, p.image_id::text AS image_id,
         p.created_at, p.user_id, u.name AS author_name, u.role AS author_role,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
-        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi,
+        ${savedState('posts', 'id')}
       FROM posts p JOIN users u ON u.id = p.user_id
       UNION ALL
       SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
         COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.user_id, u.name AS author_name, u.role AS author_role,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi,
+        ${savedState('rp', 'id')}
       FROM papers rp JOIN users u ON u.id = rp.user_id
       WHERE rp.status = 'approved'
     ) feed ORDER BY created_at DESC LIMIT 50`)
@@ -197,11 +246,13 @@ app.get('/api/posts', auth, async (req, res) => {
 })
 
 app.get('/api/papers/search', auth, async (req, res) => {
+  await ensureUnsortedFolder(req.userId)
   const q = String(req.query.q ?? '').trim().slice(0, 200)
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(`
     SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi,
-      p.reviewed_at, p.created_at, u.name AS submitter_name
+      p.reviewed_at, p.created_at, u.name AS submitter_name,
+      ${savedState('p', 'id')}
     FROM papers p JOIN users u ON u.id = p.user_id
     WHERE p.status = 'approved'
       AND (p.title ILIKE $1 OR p.abstract ILIKE $1 OR p.domain ILIKE $1 OR p.doi ILIKE $1
@@ -278,6 +329,116 @@ app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res)
   if (!result) throw new Error('Paper submission could not be confirmed')
 
   res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
+})
+
+app.get('/api/saved/folders', auth, async (req, res) => {
+  await ensureUnsortedFolder(req.userId)
+  const { rows } = await pool.query(`
+    SELECT f.id, f.name, f.is_default, f.created_at,
+      count(si.id)::int AS item_count
+    FROM save_folders f LEFT JOIN saved_items si ON si.folder_id = f.id
+    WHERE f.user_id = $1 GROUP BY f.id ORDER BY f.is_default DESC, lower(f.name)`, [req.userId])
+  res.json(rows)
+})
+
+app.post('/api/saved/folders', auth, async (req, res) => {
+  const name = String(req.body?.name ?? '').trim()
+  if (!name || name.length > 80) return res.status(400).json({ error: 'Folder name must be 1 to 80 characters' })
+  try {
+    const { rows } = await pool.query('INSERT INTO save_folders (user_id, name) VALUES ($1, $2) RETURNING id, name, is_default, created_at', [req.userId, name])
+    res.status(201).json({ ...rows[0], item_count: 0 })
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'You already have a folder with this name' })
+    throw err
+  }
+})
+
+app.patch('/api/saved/folders/:id', auth, async (req, res) => {
+  const name = String(req.body?.name ?? '').trim()
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Folder not found' })
+  if (!name || name.length > 80) return res.status(400).json({ error: 'Folder name must be 1 to 80 characters' })
+  try {
+    const { rows } = await pool.query('UPDATE save_folders SET name = $1, updated_at = now() WHERE id = $2 AND user_id = $3 AND NOT is_default RETURNING id, name, is_default, updated_at', [name, req.params.id, req.userId])
+    if (!rows[0]) return res.status(404).json({ error: 'Folder not found or cannot be renamed' })
+    res.json(rows[0])
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'You already have a folder with this name' })
+    throw err
+  }
+})
+
+app.delete('/api/saved/folders/:id', auth, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Folder not found' })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const folder = await client.query('SELECT id, is_default FROM save_folders WHERE id = $1 AND user_id = $2 FOR UPDATE', [req.params.id, req.userId])
+    if (!folder.rows[0] || folder.rows[0].is_default) {
+      await client.query('ROLLBACK')
+      return res.status(404).json({ error: 'Folder not found or cannot be deleted' })
+    }
+    const unsorted = await client.query('SELECT id FROM save_folders WHERE user_id = $1 AND is_default FOR UPDATE', [req.userId])
+    await client.query(`DELETE FROM saved_items old WHERE old.folder_id = $1 AND EXISTS (
+      SELECT 1 FROM saved_items existing WHERE existing.folder_id = $2
+        AND ((old.post_id IS NOT NULL AND existing.post_id = old.post_id) OR (old.paper_id IS NOT NULL AND existing.paper_id = old.paper_id)))`, [req.params.id, unsorted.rows[0].id])
+    await client.query('UPDATE saved_items SET folder_id = $1 WHERE folder_id = $2', [unsorted.rows[0].id, req.params.id])
+    await client.query('DELETE FROM save_folders WHERE id = $1', [req.params.id])
+    await client.query('COMMIT')
+    res.status(204).end()
+  } catch (err) { await client.query('ROLLBACK'); throw err } finally { client.release() }
+})
+
+const savedItemSelect = `
+  SELECT si.id, si.folder_id, sf.name AS folder_name, si.created_at AS saved_at,
+    CASE WHEN si.post_id IS NOT NULL THEN 'post' ELSE 'paper' END AS item_type,
+    si.post_id, si.paper_id,
+    CASE WHEN si.post_id IS NOT NULL THEN json_build_object('id', p.id, 'body', p.body, 'image_id', p.image_id, 'created_at', p.created_at, 'user_id', p.user_id, 'author_name', pu.name, 'author_role', pu.role)
+      ELSE json_build_object('id', rp.id, 'title', rp.title, 'abstract', rp.abstract, 'authors', rp.authors, 'domain', rp.domain, 'tags', rp.tags, 'doi', rp.doi, 'created_at', rp.created_at, 'reviewed_at', rp.reviewed_at, 'user_id', rp.user_id, 'author_name', ru.name, 'author_role', ru.role) END AS content
+  FROM saved_items si JOIN save_folders sf ON sf.id = si.folder_id
+  LEFT JOIN posts p ON p.id = si.post_id LEFT JOIN users pu ON pu.id = p.user_id
+  LEFT JOIN papers rp ON rp.id = si.paper_id LEFT JOIN users ru ON ru.id = rp.user_id`
+
+app.get('/api/saved/items', auth, async (req, res) => {
+  await ensureUnsortedFolder(req.userId)
+  const folder = req.query.folder && /^\d+$/.test(req.query.folder) ? req.query.folder : null
+  const type = ['post', 'paper'].includes(req.query.type) ? req.query.type : null
+  const { rows } = await pool.query(`${savedItemSelect}
+    WHERE si.user_id = $1 ${folder ? 'AND si.folder_id = $2' : ''} ${type === 'post' ? 'AND si.post_id IS NOT NULL' : type === 'paper' ? 'AND si.paper_id IS NOT NULL' : ''}
+    AND (si.post_id IS NOT NULL OR rp.status = 'approved') ORDER BY si.created_at DESC LIMIT 200`, folder ? [req.userId, folder] : [req.userId])
+  res.json(rows)
+})
+
+app.post('/api/saved/items', auth, async (req, res) => {
+  const type = req.body?.item_type
+  const itemId = String(req.body?.item_id ?? '')
+  const folderId = String(req.body?.folder_id ?? '')
+  if (!['post', 'paper'].includes(type) || !/^\d+$/.test(itemId) || !/^\d+$/.test(folderId)) return res.status(400).json({ error: 'Invalid saved item' })
+  const owner = await pool.query('SELECT id FROM save_folders WHERE id = $1 AND user_id = $2', [folderId, req.userId])
+  if (!owner.rows[0]) return res.status(404).json({ error: 'Folder not found' })
+  const source = type === 'post'
+    ? await pool.query('SELECT id FROM posts WHERE id = $1', [itemId])
+    : await pool.query("SELECT id FROM papers WHERE id = $1 AND status = 'approved'", [itemId])
+  if (!source.rows[0]) return res.status(404).json({ error: 'Content not found' })
+  const column = type === 'post' ? 'post_id' : 'paper_id'
+  const { rows } = await pool.query(`INSERT INTO saved_items (user_id, folder_id, ${column}) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`, [req.userId, folderId, itemId])
+  const result = await pool.query(`${savedItemSelect} WHERE si.user_id = $1 AND si.id = $2`, [req.userId, rows[0]?.id ?? (await pool.query(`SELECT id FROM saved_items WHERE user_id = $1 AND folder_id = $2 AND ${column} = $3`, [req.userId, folderId, itemId])).rows[0].id])
+  res.status(rows[0] ? 201 : 200).json(result.rows[0])
+})
+
+app.patch('/api/saved/items/:id', auth, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id) || !/^\d+$/.test(String(req.body?.folder_id ?? ''))) return res.status(400).json({ error: 'Invalid saved item or folder' })
+  const { rows } = await pool.query(`UPDATE saved_items si SET folder_id = $1 FROM save_folders sf
+    WHERE si.id = $2 AND si.user_id = $3 AND sf.id = $1 AND sf.user_id = $3 RETURNING si.id`, [req.body.folder_id, req.params.id, req.userId])
+  if (!rows[0]) return res.status(404).json({ error: 'Saved item or folder not found' })
+  const result = await pool.query(`${savedItemSelect} WHERE si.user_id = $1 AND si.id = $2`, [req.userId, req.params.id])
+  res.json(result.rows[0])
+})
+
+app.delete('/api/saved/items/:id', auth, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Saved item not found' })
+  const { rowCount } = await pool.query('DELETE FROM saved_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId])
+  if (!rowCount) return res.status(404).json({ error: 'Saved item not found' })
+  res.status(204).end()
 })
 
 app.get('/api/papers/my-submissions', auth, async (req, res) => {
