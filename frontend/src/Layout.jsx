@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
+  House, UsersThree, Article, CalendarBlank, ChatCircleDots, ChatCircle, Bell,
   UploadSimple, ShieldCheck, GearSix, Question, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
 import { Avatar } from './components/ui'
@@ -15,8 +15,8 @@ const MAIN_NAV = [
   { to: '/articles', label: 'Research papers', icon: Article },
   { to: '/events', label: 'Events', icon: CalendarBlank },
   { to: '/messages', label: 'Messages', icon: ChatCircleDots, badge: CONVERSATIONS.filter((c) => c.unread).length },
+  { to: '/chat', label: 'Chat', icon: ChatCircle, badge: 0 },
   { to: '/notifications', label: 'Notifications', icon: Bell, badge: NOTIFICATIONS.filter((n) => n.unread).length },
-  { to: '/tools', label: 'Citation tools', icon: Quotes },
 ]
 
 const WORK_NAV = [

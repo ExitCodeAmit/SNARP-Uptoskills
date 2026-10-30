@@ -23,6 +23,7 @@ if (!process.env.JWT_SECRET) {
   console.log('Generated JWT_SECRET in backend/.env')
 }
 const JWT_SECRET = process.env.JWT_SECRET
+const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
 
 // Creates the database and tables on first run; no-op when they already exist
 async function setupDb() {
@@ -68,6 +69,22 @@ async function setupDb() {
         CHECK (length(body) <= 5000 AND (length(trim(body)) > 0 OR image_id IS NOT NULL));
     EXCEPTION WHEN duplicate_object THEN NULL;
     END $$;
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id             SERIAL PRIMARY KEY,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title          VARCHAR(200) NOT NULL DEFAULT 'New chat',
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id             SERIAL PRIMARY KEY,
+      session_id     INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role           VARCHAR(10) NOT NULL CHECK (role IN ('user', 'assistant')),
+      content        TEXT NOT NULL,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS chat_messages_session_id_idx ON chat_messages (session_id);
+    CREATE INDEX IF NOT EXISTS chat_messages_created_at_idx ON chat_messages (created_at);
     CREATE TABLE IF NOT EXISTS papers (
       id                 BIGSERIAL PRIMARY KEY,
       user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -394,6 +411,89 @@ app.delete('/api/posts/:id', auth, async (req, res) => {
   )
   if (!rows[0].n) return res.status(404).json({ error: 'Post not found' })
   res.status(204).end()
+
+// Chat routes
+app.post('/api/chat', auth, async (req, res) => {
+  const { sessionId, role, content } = req.body
+  if (!content || content.trim().length === 0) return res.status(400).json({ error: 'Message content required' })
+  const roleValid = role && role in ['user', 'assistant'] ? role : 'user'
+  const { rows } = await pool.query(
+    `INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, $3, $4) RETURNING id, session_id, role, content, created_at`,
+    [sessionId || null, req.userId, roleValid, content.trim()]
+  )
+  let session = rows[0].session_id
+  if (!session) {
+    const sessRows = await pool.query(
+      `INSERT INTO chat_sessions (user_id, title) VALUES ($1, $2) RETURNING id`,
+      [req.userId, `Chat ${new Date().toLocaleDateString()}`]
+    )
+    session = sessRows.rows[0].id
+    await pool.query(
+      `UPDATE chat_messages SET session_id = $1 WHERE id = $2`,
+      [session, rows[0].id]
+    )
+  }
+  res.json({ id: rows[0].id, session_id: session, role: rows[0].role, content: rows[0].content, created_at: rows[0].created_at })
+})
+
+app.get('/api/chat/:session', auth, async (req, res) => {
+  const { session } = req.params
+  const { rows } = await pool.query(
+    `SELECT id, role, content, created_at FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC`,
+    [session]
+  )
+  res.json(rows)
+})
+
+app.post('/api/chat/ai', auth, async (req, res) => {
+  const { message } = req.body
+  if (!message || message.trim().length === 0) {
+    return res.status(400).json({ error: 'Message required' })
+  }
+
+  try {
+    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: 'You are a helpful research assistant for UptoSkills. Answer questions about academic research, papers, and student life.' },
+          { role: 'user', content: message }
+        ],
+        temperature: 0.7,
+        max_tokens: 1000,
+      }),
+    })
+
+    if (!groqResponse.ok) {
+      const errData = await groqResponse.json()
+      return res.status(500).json({ error: errData.error?.message || 'AI service error' })
+    }
+
+    const data = await groqResponse.json()
+    const aiResponse = data.choices[0].message.content.trim()
+    
+    // Save user message
+    await pool.query(
+      `INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, 'user', $3)`,
+      [req.sessionId || 1, req.userId, message.trim()]
+    )
+    
+    // Save AI response
+    await pool.query(
+      `INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, 'assistant', $3)`,
+      [req.sessionId || 1, req.userId, aiResponse]
+    )
+    
+    res.json({ response: aiResponse })
+  } catch (err) {
+    console.error('Groq error:', err)
+    res.status(500).json({ error: 'Failed to get AI response' })
+  }
 })
 
 // Public by unguessable UUID so <img> tags work without auth headers

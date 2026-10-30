@@ -477,7 +477,7 @@ Then kill the conflicting process or change `PGPORT` in `.env` to another port (
 
 ---
 
-## ✅ Quick Checklist
+<!-- ## ✅ Quick Checklist
 
 - [ ] PostgreSQL installed and running on port `5432`
 - [ ] pgAdmin 4 installed and connected to local server
@@ -485,7 +485,7 @@ Then kill the conflicting process or change `PGPORT` in `.env` to another port (
 - [ ] `npm install` completed in the `backend/` folder
 - [ ] `npm run dev` runs without errors
 - [ ] Tables (`users`, `images`, `posts`, `papers`) visible in pgAdmin
-- [ ] API accessible at `http://localhost:5000`
+- [ ] API accessible at `http://localhost:5000` -->
 
 ---
 
