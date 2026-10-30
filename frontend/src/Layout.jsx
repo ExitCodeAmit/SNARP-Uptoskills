@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
+  House, UsersThree, Article, CalendarBlank, ChatCircleDots, ChatCircle, Bell,
   UploadSimple, ShieldCheck, GearSix, Question, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
 import { Avatar } from './components/ui'
