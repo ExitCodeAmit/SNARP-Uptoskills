@@ -12,6 +12,7 @@ import logo from './assets/logo.png'
 const MAIN_NAV = [
   { to: '/', label: 'Feed', icon: House, end: true },
   { to: '/communities', label: 'Communities', icon: UsersThree },
+  { to: '/researchers', label: 'Researcher Matching', icon: UsersThree },
   { to: '/articles', label: 'Research papers', icon: Article },
   { to: '/events', label: 'Events', icon: CalendarBlank },
   { to: '/messages', label: 'Messages', icon: ChatCircleDots, badge: CONVERSATIONS.filter((c) => c.unread).length },

@@ -7,6 +7,8 @@ import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { sniffImage } from './image.js'
 import { DEFAULT_MAX_PDF_BYTES, validatePaperSubmission } from './paper.js'
+import { extractPdfText } from './pdfExtractor.js'
+import { generateWithGemini } from './gemini.js'
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
@@ -91,6 +93,49 @@ async function setupDb() {
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    -- Research interests saved by each user
+    CREATE TABLE IF NOT EXISTS research_interests (
+      id         SERIAL PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      interest   VARCHAR(80) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, interest)
+    );
+
+    CREATE TABLE IF NOT EXISTS researcher_profiles (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL UNIQUE
+    REFERENCES users(id) ON DELETE CASCADE,
+  bio TEXT DEFAULT '',
+  institution VARCHAR(200),
+  research_domain VARCHAR(150),
+  skills TEXT[] NOT NULL DEFAULT '{}',
+  projects TEXT DEFAULT '',
+  publications TEXT DEFAULT '',
+  availability VARCHAR(30) DEFAULT 'open'
+    CHECK (availability IN ('open', 'busy', 'unavailable')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+    CREATE INDEX IF NOT EXISTS research_interests_interest_idx
+      ON research_interests (lower(interest));
+
+    -- Collaboration requests between users
+    CREATE TABLE IF NOT EXISTS collaboration_requests (
+      id           SERIAL PRIMARY KEY,
+      sender_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      receiver_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status       VARCHAR(20) NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending', 'accepted', 'rejected')),
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK (sender_id <> receiver_id),
+      UNIQUE (sender_id, receiver_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS collaboration_receiver_status_idx
+      ON collaboration_requests (receiver_id, status);
     CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);`)
   return pool
 }
@@ -208,6 +253,107 @@ app.get('/api/papers/search', auth, async (req, res) => {
         OR array_to_string(p.tags, ' ') ILIKE $1 OR p.authors::text ILIKE $1)
     ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC LIMIT 50`, [pattern])
   res.json(rows)
+})
+app.post('/api/researchers/profile/smart-fill', auth, async (req, res) => {
+  try {
+    // Fetch ALL papers uploaded by the logged-in researcher
+    const { rows: papers } = await pool.query(
+      `SELECT
+         id, title, abstract, doi, domain, tags,
+         authors, additional_notes, pdf_data
+       FROM papers
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.userId]
+    )
+
+    if (papers.length === 0) {
+      return res.status(400).json({
+        error: 'Upload at least one research paper before using Smart Fill.'
+      })
+    }
+
+    // Extract text from every uploaded PDF
+    const paperInformation = []
+
+    for (const paper of papers) {
+      let extractedText = ''
+
+      try {
+        extractedText = await extractPdfText(paper.pdf_data)
+      } catch (error) {
+        console.error(`PDF extraction failed for paper ${paper.id}:`, error.message)
+      }
+
+      paperInformation.push({
+        title: paper.title,
+        abstract: paper.abstract,
+        doi: paper.doi,
+        domain: paper.domain,
+        tags: paper.tags,
+        authors: paper.authors,
+        additional_notes: paper.additional_notes,
+        extracted_text: extractedText.slice(0, 10000)
+      })
+    }
+
+    // Prepare information for Gemini
+    const prompt = `
+You are an AI research profile assistant.
+
+Analyse the following research papers and suggest profile information
+for the researcher.
+
+PAPERS:
+${JSON.stringify(paperInformation)}
+
+Return ONLY a valid JSON object with these fields:
+
+{
+  "bio": "A concise professional researcher biography",
+  "institution": "Institution only if explicitly supported by the papers, otherwise empty string",
+  "research_domain": "Main research domain supported by the papers",
+  "skills": ["Evidence-based technical and research skills"],
+  "projects": "Research projects explicitly identified in the papers",
+  "publications": "Titles and publication details supported by the paper information"
+}
+
+IMPORTANT RULES:
+1. Do not invent qualifications, institutions, skills or experience.
+2. Do not assume an author belongs to an institution unless clearly stated.
+3. Do not describe pending or rejected submissions as published papers.
+4. Do not invent project names or publication details.
+5. Use empty strings or empty arrays when information is unavailable.
+6. Base every suggestion on the supplied paper information.
+7. Keep the biography concise and professional.
+`
+
+    const aiResponse = await generateWithGemini(prompt)
+
+    // Convert Gemini's JSON response into an object
+    const suggestions = JSON.parse(aiResponse)
+
+    if (
+      typeof suggestions !== 'object' ||
+      suggestions === null ||
+      Array.isArray(suggestions)
+    ) {
+      throw new Error('Gemini returned an invalid profile format')
+    }
+
+    res.json({
+      message: 'Smart Fill suggestions generated successfully',
+      paperCount: papers.length,
+      suggestions
+    })
+
+  } catch (error) {
+    console.error('Smart Fill error:', error)
+
+    res.status(500).json({
+      error: error.message || 'Unable to generate profile suggestions'
+    })
+  }
 })
 
 // Multipart: "body" text plus an optional "image" file
@@ -407,6 +553,325 @@ app.get('/api/images/:id', async (req, res) => {
 
 // Express only treats 4-arg middleware as an error handler
 // eslint-disable-next-line no-unused-vars
+// Researcher Matching: get current user's interests
+app.get('/api/researchers/interests', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT interest
+     FROM research_interests
+     WHERE user_id = $1
+     ORDER BY interest`,
+    [req.userId]
+  )
+  res.json(rows.map((row) => row.interest))
+})
+
+// Researcher Matching: replace current user's interests
+app.put('/api/researchers/interests', auth, async (req, res) => {
+  const raw = req.body?.interests
+
+  if (!Array.isArray(raw)) {
+    return res.status(400).json({ error: 'Interests must be a list' })
+  }
+
+  if (raw.length > 30) {
+    return res.status(400).json({ error: 'You can add up to 30 interests' })
+  }
+
+  const interests = [...new Set(
+    raw
+      .filter((item) => typeof item === 'string')
+      .map((item) => item.trim().replace(/\s+/g, ' '))
+      .filter((item) => item.length > 0)
+      .map((item) => item.slice(0, 80))
+      .map((item) => item.toLowerCase())
+  )]
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      'DELETE FROM research_interests WHERE user_id = $1',
+      [req.userId]
+    )
+
+    for (const interest of interests) {
+      await client.query(
+        'INSERT INTO research_interests (user_id, interest) VALUES ($1, $2)',
+        [req.userId, interest]
+      )
+    }
+
+    await client.query('COMMIT')
+    res.json({ interests })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+// Researcher Matching: recommend users with shared interests
+app.get('/api/researchers/matches', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT
+       u.id,
+       u.name,
+       u.role,
+       COALESCE(rp.institution, '') AS institution,
+       COALESCE(rp.research_domain, '') AS research_domain,
+       COALESCE(rp.availability, 'open') AS availability,
+       COALESCE(rp.skills, '{}') AS skills,
+       array_agg(ri.interest ORDER BY ri.interest) AS shared_interests,
+       count(*)::int AS match_count
+     FROM users u
+     JOIN research_interests ri ON ri.user_id = u.id
+     LEFT JOIN researcher_profiles rp ON rp.user_id = u.id
+     WHERE u.id <> $1
+       AND lower(ri.interest) IN (
+         SELECT lower(interest)
+         FROM research_interests
+         WHERE user_id = $1
+       )
+     GROUP BY
+       u.id,
+       u.name,
+       u.role,
+       rp.institution,
+       rp.research_domain,
+       rp.availability,
+       rp.skills
+     ORDER BY match_count DESC, u.name ASC
+     LIMIT 100`,
+    [req.userId]
+  )
+
+  res.json(rows)
+})
+
+// Collaboration requests: list incoming and outgoing requests
+app.get('/api/collaborations', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT
+       cr.id,
+       cr.sender_id,
+       sender.name AS sender_name,
+       cr.receiver_id,
+       receiver.name AS receiver_name,
+       cr.status,
+       cr.created_at,
+       cr.updated_at
+     FROM collaboration_requests cr
+     JOIN users sender ON sender.id = cr.sender_id
+     JOIN users receiver ON receiver.id = cr.receiver_id
+     WHERE cr.sender_id = $1 OR cr.receiver_id = $1
+     ORDER BY cr.created_at DESC`,
+    [req.userId]
+  )
+
+  res.json(rows)
+})
+
+// Collaboration requests: send a request
+app.post('/api/collaborations', auth, async (req, res) => {
+  const receiverId = Number(req.body?.receiverId)
+
+  if (!Number.isSafeInteger(receiverId) || receiverId <= 0) {
+    return res.status(400).json({ error: 'A valid researcher ID is required' })
+  }
+
+  if (receiverId === Number(req.userId)) {
+    return res.status(400).json({ error: 'You cannot request collaboration with yourself' })
+  }
+
+  const { rows: users } = await pool.query(
+    'SELECT id FROM users WHERE id = $1',
+    [receiverId]
+  )
+  if (!users[0]) {
+    return res.status(404).json({ error: 'Researcher not found' })
+  }
+
+  const { rows: existing } = await pool.query(
+    `SELECT id, status FROM collaboration_requests
+     WHERE sender_id = $1 AND receiver_id = $2`,
+    [req.userId, receiverId]
+  )
+
+  if (existing[0]) {
+    return res.status(409).json({
+      error: `A collaboration request already exists (${existing[0].status})`
+    })
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO collaboration_requests (sender_id, receiver_id)
+     VALUES ($1, $2)
+     RETURNING id, sender_id, receiver_id, status, created_at`,
+    [req.userId, receiverId]
+  )
+
+  res.status(201).json(rows[0])
+})
+
+// Collaboration requests: accept or reject an incoming request
+app.patch('/api/collaborations/:id', auth, async (req, res) => {
+  const id = Number(req.params.id)
+  const status = req.body?.status
+
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return res.status(404).json({ error: 'Collaboration request not found' })
+  }
+
+  if (!['accepted', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Status must be accepted or rejected' })
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE collaboration_requests
+     SET status = $1, updated_at = now()
+     WHERE id = $2
+       AND receiver_id = $3
+       AND status = 'pending'
+     RETURNING id, sender_id, receiver_id, status, updated_at`,
+    [status, id, req.userId]
+  )
+
+  if (!rows[0]) {
+    return res.status(404).json({
+      error: 'Pending collaboration request not found'
+    })
+  }
+
+  res.json(rows[0])
+})
+// Researcher Profiles: get the current user's profile
+app.get('/api/researchers/profile', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT
+       u.id AS user_id,
+       u.name,
+       u.role,
+       COALESCE(rp.bio, '') AS bio,
+       COALESCE(rp.institution, '') AS institution,
+       COALESCE(rp.research_domain, '') AS research_domain,
+       COALESCE(rp.skills, '{}') AS skills,
+       COALESCE(rp.projects, '') AS projects,
+       COALESCE(rp.publications, '') AS publications,
+       COALESCE(rp.availability, 'open') AS availability
+     FROM users u
+     LEFT JOIN researcher_profiles rp ON rp.user_id = u.id
+     WHERE u.id = $1`,
+    [req.userId]
+  )
+
+  res.json(rows[0])
+})
+
+// Researcher Profiles: create or update the current user's profile
+app.put('/api/researchers/profile', auth, async (req, res) => {
+  const {
+    bio = '',
+    institution = '',
+    research_domain = '',
+    skills = [],
+    projects = '',
+    publications = '',
+    availability = 'open'
+  } = req.body || {}
+
+  if (
+    typeof bio !== 'string' ||
+    typeof institution !== 'string' ||
+    typeof research_domain !== 'string' ||
+    typeof projects !== 'string' ||
+    typeof publications !== 'string'
+  ) {
+    return res.status(400).json({ error: 'Invalid profile details' })
+  }
+
+  if (!Array.isArray(skills) || skills.length > 30) {
+    return res.status(400).json({ error: 'Add up to 30 skills' })
+  }
+
+  if (!skills.every(skill => typeof skill === 'string')) {
+    return res.status(400).json({ error: 'Skills must be text values' })
+  }
+
+  if (!['open', 'busy', 'unavailable'].includes(availability)) {
+    return res.status(400).json({ error: 'Invalid availability status' })
+  }
+
+  const cleanSkills = [...new Set(
+    skills
+      .map(skill => skill.trim())
+      .filter(Boolean)
+      .map(skill => skill.slice(0, 60))
+  )]
+
+  const values = [
+    bio.trim().slice(0, 1000),
+    institution.trim().slice(0, 200),
+    research_domain.trim().slice(0, 150),
+    cleanSkills,
+    projects.trim().slice(0, 3000),
+    publications.trim().slice(0, 3000),
+    availability
+  ]
+
+  const { rows } = await pool.query(
+    `INSERT INTO researcher_profiles
+       (user_id, bio, institution, research_domain, skills,
+        projects, publications, availability, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+     ON CONFLICT (user_id)
+     DO UPDATE SET
+       bio = EXCLUDED.bio,
+       institution = EXCLUDED.institution,
+       research_domain = EXCLUDED.research_domain,
+       skills = EXCLUDED.skills,
+       projects = EXCLUDED.projects,
+       publications = EXCLUDED.publications,
+       availability = EXCLUDED.availability,
+       updated_at = now()
+     RETURNING *`,
+    [req.userId, ...values]
+  )
+
+  res.json(rows[0])
+})
+
+// Researcher Profiles: view another researcher's public profile
+app.get('/api/researchers/:id/profile', auth, async (req, res) => {
+  const researcherId = Number(req.params.id)
+
+  if (!Number.isSafeInteger(researcherId) || researcherId <= 0) {
+    return res.status(400).json({ error: 'Invalid researcher ID' })
+  }
+
+  const { rows } = await pool.query(
+    `SELECT
+       u.id AS user_id,
+       u.name,
+       u.role,
+       COALESCE(rp.bio, '') AS bio,
+       COALESCE(rp.institution, '') AS institution,
+       COALESCE(rp.research_domain, '') AS research_domain,
+       COALESCE(rp.skills, '{}') AS skills,
+       COALESCE(rp.projects, '') AS projects,
+       COALESCE(rp.publications, '') AS publications,
+       COALESCE(rp.availability, 'open') AS availability
+     FROM users u
+     LEFT JOIN researcher_profiles rp ON rp.user_id = u.id
+     WHERE u.id = $1`,
+    [researcherId]
+  )
+
+  if (!rows[0]) {
+    return res.status(404).json({ error: 'Researcher not found' })
+  }
+
+  res.json(rows[0])
+})
 app.use((err, req, res, _next) => {
   if (err instanceof multer.MulterError) {
     const error = err.code === 'LIMIT_FILE_SIZE'

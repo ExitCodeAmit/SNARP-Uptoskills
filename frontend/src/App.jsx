@@ -10,6 +10,7 @@ import { api, getToken, saveToken, clearToken } from './api'
 import Auth from './Auth'
 import Layout from './Layout'
 import Feed from './Feed'
+import ResearcherMatching from './ResearcherMatching'
 
 import {
   Communities,
@@ -90,6 +91,7 @@ export default function App() {
             />
 
             <Route path="/communities" element={<Communities />} />
+            <Route path="/researchers" element={<ResearcherMatching />} />
             <Route path="/articles" element={<Articles />} />
             <Route path="/events" element={<Events />} />
             <Route path="/messages" element={<Messages />} />
