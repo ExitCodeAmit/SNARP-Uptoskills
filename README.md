@@ -1,3 +1,5 @@
+**Abhinav Rahul**
+
 # SNARP: Social Networking & Academic Research Platform
 
 An UptoSkills internship MVP where students and researchers share updates, publish research and connect with communities.
