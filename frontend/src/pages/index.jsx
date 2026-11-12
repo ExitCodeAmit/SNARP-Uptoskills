@@ -95,12 +95,25 @@ function PaperPdf({ paperId, label = 'View paper' }) {
 
 function PublishedPaperCard({ paper }) {
   const authorNames = (paper.authors ?? []).map((author) => typeof author === 'string' ? author : author.name).filter(Boolean)
+  const dateLabel = paper.publication_date
+    ? 'Published'
+    : paper.reviewed_at ? 'Approved' : 'Submitted'
+  const dateValue = paper.publication_date
+    ? new Date(`${paper.publication_date}T00:00:00`)
+    : new Date(paper.reviewed_at ?? paper.created_at)
   return <article className="panel article">
-    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">Approved {new Date(paper.reviewed_at ?? paper.created_at).toLocaleDateString()}</time></div>
+    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">{dateLabel} {dateValue.toLocaleDateString()}</time></div>
     <h3>{paper.title}</h3>
     <p className="article-authors">{authorNames.join(', ')}</p>
     <p className="article-abstract">{paper.abstract}</p>
     <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
+    {paper.matched_interests?.length > 0 && <p className="recommendation-relevance">
+      <strong>Match score: {paper.score}</strong>
+      {' · '}
+      {paper.matched_interests.map(({ interest, signals }) => (
+        <span key={interest}>{interest} ({signals.map(({ field, points }) => `${field} +${points}`).join(', ')})</span>
+      ))}
+    </p>}
     <div className="article-actions"><PaperPdf paperId={paper.id} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
   </article>
 }
@@ -277,6 +290,7 @@ const makeInitialPaperForm = (user) => ({
   abstract: '',
   doi: '',
   domain: '',
+  publicationDate: '',
   tags: '',
   authors: [{ name: user?.name ?? '', affiliation: '' }],
   additionalNotes: '',
@@ -334,6 +348,12 @@ export function Submit({ user }) {
       const doi = form.doi.trim().replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/i, '')
       if (!/^10\.\d{4,9}\/[^\s<>]+$/i.test(doi)) next.doi = 'Enter a valid DOI, such as 10.1000/example'
     }
+    if (form.publicationDate) {
+      const date = new Date(`${form.publicationDate}T00:00:00Z`)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(form.publicationDate) || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== form.publicationDate) {
+        next.publicationDate = 'Enter a valid publication date'
+      }
+    }
     if (form.additionalNotes.length > 5000) next.additionalNotes = 'Notes must be 5,000 characters or fewer'
     if (form.authors.length === 0 || form.authors.some((author) => !author.name.trim())) {
       next.authors = 'Enter a name for each author'
@@ -364,6 +384,7 @@ export function Submit({ user }) {
     body.append('abstract', form.abstract.trim())
     body.append('doi', form.doi.trim())
     body.append('domain', form.domain.trim())
+    body.append('publicationDate', form.publicationDate)
     body.append('tags', JSON.stringify(tags))
     body.append('authors', JSON.stringify(authors))
     body.append('additionalNotes', form.additionalNotes.trim())
@@ -436,6 +457,12 @@ export function Submit({ user }) {
               <input id="p-domain" value={form.domain} maxLength={120} onChange={(e) => update('domain', e.target.value)} placeholder="AI, education, biology…" aria-invalid={!!errors.domain} aria-describedby="p-domain-error" />
               <span className="field-error" id="p-domain-error">{errors.domain}</span>
             </div>
+          </div>
+
+          <div className="field">
+            <label htmlFor="p-publication-date">Publication date (optional)</label>
+            <input id="p-publication-date" type="date" value={form.publicationDate} onChange={(e) => update('publicationDate', e.target.value)} aria-invalid={!!errors.publicationDate} aria-describedby="p-publication-date-error" />
+            <span className="field-error" id="p-publication-date-error">{errors.publicationDate}</span>
           </div>
 
           <div className="field">
@@ -614,12 +641,51 @@ function Toggle({ label, defaultOn }) {
 }
 
 export function Settings({ user }) {
+  const [interests, setInterests] = useState('')
+  const [profileLoading, setProfileLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [profileError, setProfileError] = useState('')
   const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    api('/auth/me')
+      .then((profile) => {
+        if (active) setInterests((profile.research_interests ?? []).join(', '))
+      })
+      .catch((err) => {
+        if (active) setProfileError(err.message)
+      })
+      .finally(() => {
+        if (active) setProfileLoading(false)
+      })
+    return () => { active = false }
+  }, [])
+
+  const saveProfile = async (e) => {
+    e.preventDefault()
+    setSaving(true)
+    setProfileError('')
+    setSaved(false)
+    try {
+      const researchInterests = interests.split(/[,\n]/).map((interest) => interest.trim()).filter(Boolean)
+      const result = await api('/auth/profile', {
+        method: 'PATCH',
+        body: { research_interests: researchInterests },
+      })
+      setInterests(result.research_interests.join(', '))
+      setSaved(true)
+    } catch (err) {
+      setProfileError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="page">
       <PageHeader title="Settings" sub="Manage your profile and notification preferences." />
-      {saved && <p className="notice">Saving settings is coming soon. Nothing was changed.</p>}
-      <form className="panel form-panel" onSubmit={(e) => { e.preventDefault(); setSaved(true) }}>
+      <form className="panel form-panel" onSubmit={saveProfile}>
         <h3 className="form-title">Profile</h3>
         <div className="settings-avatar">
           <Avatar name={user.name} size="lg" />
@@ -640,14 +706,28 @@ export function Settings({ user }) {
           <input id="s-aff" placeholder="University or organisation" />
         </div>
         <div className="field">
-          <label htmlFor="s-bio">Bio</label>
-          <textarea id="s-bio" rows={3} placeholder="A line about your research interests" />
+          <label htmlFor="s-interests">Research interests</label>
+          <textarea
+            id="s-interests"
+            rows={3}
+            value={interests}
+            onChange={(e) => { setInterests(e.target.value); setSaved(false) }}
+            placeholder="Artificial Intelligence, Machine Learning, Data Science"
+            aria-describedby="s-interests-help"
+            disabled={profileLoading || saving}
+          />
+          <span id="s-interests-help" className="muted-sm">Separate interests with commas or new lines. Add up to 20.</span>
         </div>
+        {profileError && <p className="alert" role="alert">{profileError}</p>}
+        {saved && <p className="notice" role="status">Research interests saved.</p>}
+        <p className="muted-sm">Other profile fields and notification preferences are not saved yet.</p>
+        <button className="btn btn-primary" type="submit" disabled={profileLoading || saving}>
+          {profileLoading ? 'Loading profile…' : saving ? 'Saving…' : 'Save research interests'}
+        </button>
         <h3 className="form-title">Notifications</h3>
         <Toggle label="Email me when my paper is reviewed" defaultOn />
         <Toggle label="Comments on my posts" defaultOn />
         <Toggle label="New members in my communities" />
-        <button className="btn btn-primary">Save changes</button>
       </form>
     </div>
   )
@@ -679,6 +759,34 @@ export function Search() {
   const q = query.toLowerCase()
   const [papers, setPapers] = useState([])
   const [paperError, setPaperError] = useState('')
+  const [recommendations, setRecommendations] = useState([])
+  const [recommendationLoading, setRecommendationLoading] = useState(true)
+  const [recommendationError, setRecommendationError] = useState(null)
+  const [recommendationRequest, setRecommendationRequest] = useState(0)
+
+  useEffect(() => {
+    let active = true
+    api('/papers/recommendations')
+      .then((result) => { if (active) setRecommendations(result) })
+      .catch((err) => {
+        if (!active) return
+        setRecommendationError({
+          message: err.status === 401
+            ? 'Your session may have expired. Sign out and sign in again to view personalized recommendations.'
+            : err.message || 'Recommendations could not be loaded.',
+          status: err.status,
+        })
+      })
+      .finally(() => { if (active) setRecommendationLoading(false) })
+    return () => { active = false }
+  }, [recommendationRequest])
+
+  const refreshRecommendations = () => {
+    setRecommendationLoading(true)
+    setRecommendationError(null)
+    setRecommendationRequest((request) => request + 1)
+  }
+
   useEffect(() => {
     if (!query.trim()) return
     let active = true
@@ -693,6 +801,28 @@ export function Search() {
   return (
     <div className="page">
       <PageHeader title={`Results for "${params.get('q') ?? ''}"`} sub={`${total} result${total === 1 ? '' : 's'}`} />
+      <section className="recommendations" aria-labelledby="recommendations-title">
+        <div className="recommendation-heading">
+          <div>
+            <h2 className="section-title" id="recommendations-title">Recommended For You</h2>
+            <p className="recommendation-description">Discover research papers selected based on your interests.</p>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={refreshRecommendations} disabled={recommendationLoading}>
+            {recommendationLoading ? 'Refreshing…' : 'Refresh Recommendations'}
+          </button>
+        </div>
+        {recommendationError && <p className="alert" role="alert">
+          {recommendationError.message}
+          {recommendationError.status ? ` (HTTP ${recommendationError.status})` : ''}
+        </p>}
+        {recommendationLoading
+          ? <p className="muted-sm" role="status">Loading recommendations…</p>
+          : recommendationError
+            ? null
+            : recommendations.length
+              ? <div className="stack">{recommendations.map((paper) => <PublishedPaperCard key={paper.id} paper={paper} />)}</div>
+              : <div className="panel empty"><h3>No recommendations yet</h3><p>No approved papers match your saved interests yet. Add or update interests in Settings, or check back as more papers are approved.</p></div>}
+      </section>
       {paperError && <p className="alert" role="alert">{paperError}</p>}
       {total === 0 && !paperError && <div className="panel empty"><h3>Nothing found</h3><p>Try a different word, like a topic or an author.</p></div>}
       {shownPapers.length > 0 && <><h2 className="section-title">Research papers</h2><div className="stack">{shownPapers.map((paper) => <PublishedPaperCard key={paper.id} paper={paper} />)}</div></>}

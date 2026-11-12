@@ -761,6 +761,44 @@ button {
   font-weight: 600;
 }
 
+.recommendations {
+  margin-bottom: 28px;
+}
+
+.recommendations .section-title {
+  margin-top: 0;
+}
+
+.recommendation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.recommendation-heading .section-title {
+  margin-bottom: 4px;
+}
+
+.recommendation-description {
+  color: var(--text-2);
+  font-size: 0.92rem;
+}
+
+.recommendation-relevance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 12px;
+  color: var(--text-2);
+  font-size: 0.86rem;
+}
+
+.recommendation-relevance strong {
+  color: var(--teal-ink);
+}
+
 .stack {
   display: flex;
   flex-direction: column;
@@ -1790,6 +1828,15 @@ button {
 }
 
 @media (max-width: 680px) {
+  .recommendation-heading {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .recommendation-heading .btn {
+    align-self: flex-start;
+  }
+
   .form-row,
   .form-row-3 {
     grid-template-columns: 1fr;

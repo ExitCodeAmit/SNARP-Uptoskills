@@ -36,8 +36,9 @@ This README describes the project **as it stands today**: what works end to end,
 | Messages, Notifications | 🎨 UI only | Sample conversations and alerts |
 | Submit a paper | Implemented MVP | Authenticated submissions save metadata and PDF bytes in PostgreSQL; new papers are pending |
 | Paper moderation | Implemented MVP | Admin/Moderator dashboard persists approval and rejection details |
-| Settings, Help center | 🎨 UI only | FAQ and contact details are real |
+| Settings, Help center | Partial | Research interests save to the profile; other settings are UI only |
 | Search bar | Partial | Approved papers are searched from PostgreSQL; communities and events remain sample data |
+| Personalized paper recommendations | Implemented MVP | Approved papers are ranked using saved research interests |
 | Like / Comment / Share on posts | 🎨 UI only | Like toggles locally and resets on refresh |
 
 All sample content lives in one file, [`frontend/src/sample.js`](frontend/src/sample.js), so each list can be replaced with an API call when its backend is built.
@@ -180,7 +181,20 @@ Open **http://localhost:5173**, create an account, and post.
 | frontend | `npm test` | Citation generator tests |
 | backend | `npm start` | Start the API |
 | backend | `npm run dev` | Start the API with auto-restart |
-| backend | `npm test` | Image signature tests |
+| backend | `npm run seed:demo` | Seed synthetic recommendation examples through local submission and moderation APIs (development only) |
+| backend | `npm test` | Paper validation, recommendation scoring and image signature tests |
+
+### Seed recommendation demo data
+
+Start PostgreSQL and the backend first. In a separate PowerShell terminal in `backend`, explicitly enable the local-only seed and run it:
+
+```powershell
+$env:NODE_ENV = 'development'
+$env:ALLOW_DEMO_SEED = 'true'
+npm run seed:demo
+```
+
+The repeatable seed submits ten synthetic papers, with valid demonstration PDFs, under clearly marked demo accounts and approves them through the existing moderation API. Their tags and notes identify them as `DEMO DATA`; their dates are illustrative only, and they have no DOI or real-person authors. The seed refuses production mode, production-named databases, and non-local PostgreSQL hosts. It does not update or remove existing records. After seeding, save interests from **Settings** using the existing profile form, then open `/search`.
 
 ### Resetting the postgres password
 
@@ -208,6 +222,7 @@ erDiagram
         VARCHAR(255) email "NOT NULL, UNIQUE"
         TEXT password_hash "bcrypt hash"
         VARCHAR(20) role "admin | moderator | author | user"
+        TEXT[] research_interests "NOT NULL, default empty list"
         TIMESTAMPTZ created_at "DEFAULT now()"
     }
 
@@ -234,6 +249,7 @@ erDiagram
         TEXT abstract "NOT NULL"
         VARCHAR(255) doi "nullable"
         VARCHAR(120) domain "NOT NULL"
+        DATE publication_date "nullable"
         TEXT[] tags
         JSONB authors
         BYTEA pdf_data "PDF, maximum 10 MB"
@@ -259,6 +275,7 @@ erDiagram
 | `email` | `VARCHAR(255)` | Not null, unique, stored lowercase |
 | `password_hash` | `TEXT` | bcrypt hash (cost 10), never returned by the API |
 | `role` | `VARCHAR(20)` | `admin`, `moderator`, `author` or `user`, default `user` |
+| `research_interests` | `TEXT[]` | Saved recommendation topics; defaults to an empty list |
 | `created_at` | `TIMESTAMPTZ` | Default `now()` |
 
 Sign-up only allows `user` or `author`. Admins and moderators must be promoted in the database:
@@ -300,6 +317,7 @@ The backend creates this table on startup if it does not exist. It stores the up
 | `user_id` | `INTEGER` | References `users(id)`, cascade delete |
 | `title`, `abstract`, `domain` | `VARCHAR` / `TEXT` | Required paper metadata |
 | `doi` | `VARCHAR(255)` | Optional validated DOI |
+| `publication_date` | `DATE` | Optional date supplied with the submission |
 | `tags` | `TEXT[]` | Research keywords |
 | `authors` | `JSONB` | Author names and optional affiliations |
 | `pdf_data` | `BYTEA` | Validated PDF content, up to 10 MB |
@@ -315,7 +333,7 @@ The optional `PAPER_MAX_PDF_BYTES` setting can lower the server upload limit; it
 
 ### Upgrades
 
-Databases created by earlier versions of this project are upgraded automatically on start: the `image_id` column is added to `posts`, the old text-only check is replaced with `posts_content_check`, the `papers` table is created if missing, and review columns are added safely if absent. No existing data is removed.
+Databases created by earlier versions of this project are upgraded automatically on start: the `image_id` column is added to `posts`, the old text-only check is replaced with `posts_content_check`, the `papers` table is created if missing, review columns and nullable `publication_date` are added safely if absent, and `users.research_interests` is added with an empty-list default if absent. No existing data is removed.
 
 ---
 
@@ -329,21 +347,23 @@ Authenticated routes need the header `Authorization: Bearer <token>`. Errors alw
 |---|---|---|---|---|
 | `POST` | `/auth/signup` | No | JSON `{ name, email, password, role? }` | `201 { token, user }` |
 | `POST` | `/auth/login` | No | JSON `{ email, password }` | `200 { token, user }` |
-| `GET` | `/auth/me` | Yes | | `200 { id, name, email, role, created_at, post_count }` |
+| `GET` | `/auth/me` | Yes | | `200 { id, name, email, role, created_at, post_count, research_interests }` |
+| `PATCH` | `/auth/profile` | Yes | JSON `{ research_interests: string[] }` (up to 20 interests, 100 characters each) | `200 { research_interests }` |
 | `GET` | `/posts` | Yes | | `200 [feed item]` (latest 50 posts and approved papers, newest first) |
 | `POST` | `/posts` | Yes | `multipart/form-data`: `body` (text), `image` (file, optional) | `201 post` |
 | `DELETE` | `/posts/:id` | Yes (owner) | | `204` |
 | `GET` | `/images/:uuid` | No | | Image bytes with the correct `Content-Type` |
-| `POST` | `/papers/submit` | Yes | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, JSON `tags`, JSON `authors`, optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
+| `POST` | `/papers/submit` | Yes | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, optional `publicationDate` (`YYYY-MM-DD`), JSON `tags`, JSON `authors`, optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
 | `GET` | `/papers/my-submissions` | Yes | | Own submissions and review status/rejection reason only |
 | `GET` | `/papers/search?q=...` | Yes | | Approved papers only; omit `q` to list approved papers |
+| `GET` | `/papers/recommendations` | Yes | | Up to 10 approved papers with score and matching factors, ranked against saved research interests |
 | `GET` | `/papers/:id/pdf` | Yes | | PDF bytes for the submitting user, Admin/Moderator, or any authenticated user after approval |
 | `GET` | `/moderation/papers?status=pending` | Moderator/Admin | Optional `status` (`pending`, `approved`, `rejected`, `reviewed`), `page`, `limit` | Paper metadata plus pagination; no PDF bytes |
 | `GET` | `/moderation/papers/:id` | Moderator/Admin | | Full review metadata |
 | `PATCH` | `/moderation/papers/:id/approve` | Moderator/Admin | | Atomic pending → approved decision with reviewer and timestamp |
 | `PATCH` | `/moderation/papers/:id/reject` | Moderator/Admin | JSON `{ "reason": "..." }` | Atomic pending → rejected decision with reviewer, timestamp and reason |
 
-The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; public paper queries filter to `approved` in SQL.
+Recommendations award +3 for an exact tag match, +4 for a domain match, +2 for a title match, and +1 for an abstract match per distinct saved interest. Results exclude the requesting user's papers and use publication date (or submission date if unavailable) to break score ties. Each result includes `score` and `matched_interests`, including the matching fields and point values. The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; public paper queries filter to `approved` in SQL.
 
 **Example: submit a paper with curl**
 
@@ -412,6 +432,9 @@ SNARP-Uptoskills/
 │   ├── server.js             DB setup, auth, posts, images, error handling
 │   ├── image.js              Detects real image type from file bytes
 │   ├── image.test.js         Tests for image.js
+│   ├── recommendations.js    Paper recommendation scoring and ranking
+│   ├── recommendations.test.js Tests for recommendation scoring and ranking
+│   ├── seed-demo-papers.js   Development-only demo data via submission and moderation APIs
 │   ├── .env.example          Template for backend/.env (copy and fill in)
 │   ├── package.json
 │   └── package-lock.json
@@ -543,7 +566,7 @@ Remaining roadmap work, following `social_Academic_Research_Platform_Roadmap.doc
 - [ ] Real communities, events, messages and notifications (Socket.IO)
 - [ ] Likes and comments on posts
 - [ ] PostgreSQL full-text search
-- [ ] Settings: update profile, avatar and password
+- [ ] Settings: update avatar and password
 - [ ] Editing posts and pagination beyond the latest 50
 - [ ] Rate limiting on login (e.g. `express-rate-limit`) before public deployment
 - [ ] Forgot password flow

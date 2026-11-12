@@ -342,9 +342,12 @@ CREATE TABLE users (
   password_hash TEXT NOT NULL,
   role          VARCHAR(20) NOT NULL DEFAULT 'user'
                 CHECK (role IN ('admin', 'moderator', 'author', 'user')),
+  research_interests TEXT[] NOT NULL DEFAULT '{}',
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+Existing databases receive the `research_interests` column and the nullable `papers.publication_date` column automatically at backend startup. Existing users keep an empty interests list and existing papers keep a null publication date. No existing profile or paper data is removed.
 
 ### `images`
 ```sql
@@ -379,6 +382,7 @@ CREATE TABLE papers (
   abstract           TEXT NOT NULL,
   doi                VARCHAR(255),
   domain             VARCHAR(120) NOT NULL,
+  publication_date   DATE,
   tags               TEXT[] NOT NULL DEFAULT '{}',
   authors            JSONB NOT NULL,
   pdf_data           BYTEA NOT NULL,

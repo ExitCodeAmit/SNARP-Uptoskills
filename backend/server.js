@@ -7,6 +7,7 @@ import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { sniffImage } from './image.js'
 import { DEFAULT_MAX_PDF_BYTES, validatePaperSubmission } from './paper.js'
+import { rankRecommendations } from './recommendations.js'
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
@@ -43,8 +44,10 @@ async function setupDb() {
       email         VARCHAR(255) NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role          VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'moderator', 'author', 'user')),
+      research_interests TEXT[] NOT NULL DEFAULT '{}',
       created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS research_interests TEXT[] NOT NULL DEFAULT '{}';
     -- Post images live in Postgres as BYTEA
     CREATE TABLE IF NOT EXISTS images (
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -75,6 +78,7 @@ async function setupDb() {
       abstract           TEXT NOT NULL,
       doi                VARCHAR(255),
       domain             VARCHAR(120) NOT NULL,
+      publication_date   DATE,
       tags               TEXT[] NOT NULL DEFAULT '{}',
       authors            JSONB NOT NULL,
       pdf_data           BYTEA NOT NULL,
@@ -91,6 +95,7 @@ async function setupDb() {
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
     ALTER TABLE papers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    ALTER TABLE papers ADD COLUMN IF NOT EXISTS publication_date DATE;
     CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);`)
   return pool
 }
@@ -170,7 +175,40 @@ app.get('/api/auth/me', auth, async (req, res) => {
     [req.userId]
   )
   if (!rows[0]) return res.status(401).json({ error: 'Please log in again' })
-  res.json({ ...publicUser(rows[0]), post_count: rows[0].post_count })
+  res.json({
+    ...publicUser(rows[0]),
+    post_count: rows[0].post_count,
+    research_interests: rows[0].research_interests ?? [],
+  })
+})
+
+app.patch('/api/auth/profile', auth, async (req, res) => {
+  const interests = req.body?.research_interests
+  if (!Array.isArray(interests) || interests.length > 20 || interests.some((interest) => typeof interest !== 'string')) {
+    return res.status(400).json({ error: 'Research interests must be a list of up to 20 text values', field: 'research_interests' })
+  }
+
+  const normalizedInterests = []
+  const seen = new Set()
+  for (const value of interests) {
+    const interest = value.trim()
+    if (!interest) continue
+    if (interest.length > 100) {
+      return res.status(400).json({ error: 'Each research interest must be 100 characters or fewer', field: 'research_interests' })
+    }
+    const key = interest.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      normalizedInterests.push(interest)
+    }
+  }
+
+  const { rows } = await pool.query(
+    'UPDATE users SET research_interests = $1 WHERE id = $2 RETURNING research_interests',
+    [normalizedInterests, req.userId]
+  )
+  if (!rows[0]) return res.status(401).json({ error: 'Please log in again' })
+  res.json({ research_interests: rows[0].research_interests })
 })
 
 const POST_SELECT = `
@@ -184,12 +222,12 @@ app.get('/api/posts', auth, async (req, res) => {
       SELECT 'post'::text AS type, p.id::text AS id, p.body, p.image_id::text AS image_id,
         p.created_at, p.user_id, u.name AS author_name, u.role AS author_role,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
-        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi, NULL::date AS publication_date
       FROM posts p JOIN users u ON u.id = p.user_id
       UNION ALL
       SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
         COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.user_id, u.name AS author_name, u.role AS author_role,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi, rp.publication_date
       FROM papers rp JOIN users u ON u.id = rp.user_id
       WHERE rp.status = 'approved'
     ) feed ORDER BY created_at DESC LIMIT 50`)
@@ -200,7 +238,7 @@ app.get('/api/papers/search', auth, async (req, res) => {
   const q = String(req.query.q ?? '').trim().slice(0, 200)
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(`
-    SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi,
+    SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi, p.publication_date,
       p.reviewed_at, p.created_at, u.name AS submitter_name
     FROM papers p JOIN users u ON u.id = p.user_id
     WHERE p.status = 'approved'
@@ -208,6 +246,38 @@ app.get('/api/papers/search', auth, async (req, res) => {
         OR array_to_string(p.tags, ' ') ILIKE $1 OR p.authors::text ILIKE $1)
     ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC LIMIT 50`, [pattern])
   res.json(rows)
+})
+
+app.get('/api/papers/recommendations', auth, async (req, res) => {
+  const profile = await pool.query('SELECT research_interests FROM users WHERE id = $1', [req.userId])
+  if (!profile.rows[0]) return res.status(401).json({ error: 'Please log in again' })
+
+  const interests = profile.rows[0].research_interests ?? []
+  if (!interests.length) return res.json([])
+
+  const { rows } = await pool.query(`
+    SELECT p.id, p.user_id, p.status, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi, p.publication_date,
+      p.reviewed_at, p.created_at
+    FROM papers p
+    WHERE p.status = 'approved'
+      AND p.user_id <> $1
+      AND EXISTS (
+        SELECT 1
+        FROM unnest($2::text[]) AS user_interest(interest)
+        WHERE trim(user_interest.interest) <> ''
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(p.tags, '{}'::text[])) AS paper_tag(tag)
+              WHERE lower(trim(paper_tag.tag)) = lower(trim(user_interest.interest))
+            )
+            OR position(lower(trim(user_interest.interest)) IN lower(p.domain)) > 0
+            OR position(lower(trim(user_interest.interest)) IN lower(p.title)) > 0
+            OR position(lower(trim(user_interest.interest)) IN lower(p.abstract)) > 0
+          )
+      )
+    ORDER BY COALESCE(p.publication_date, p.created_at::date) DESC, p.id DESC`, [req.userId, interests])
+  res.json(rankRecommendations(rows, interests, req.userId))
 })
 
 // Multipart: "body" text plus an optional "image" file
@@ -244,9 +314,9 @@ app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res)
 
   const inserted = await pool.query(
     `INSERT INTO papers
-       (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
+       (user_id, title, abstract, doi, domain, publication_date, tags, authors, pdf_data, pdf_filename,
         pdf_content_type, pdf_size, additional_notes, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, 'application/pdf', $11, $12, $13)
      ON CONFLICT (user_id, idempotency_key) DO NOTHING
      RETURNING id, title, status, created_at`,
     [
@@ -255,6 +325,7 @@ app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res)
       paper.abstract,
       paper.doi,
       paper.domain,
+      paper.publicationDate,
       paper.tags,
       JSON.stringify(paper.authors),
       paper.pdfData,
@@ -282,7 +353,7 @@ app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res)
 
 app.get('/api/papers/my-submissions', auth, async (req, res) => {
   const { rows } = await pool.query(`
-    SELECT id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
+    SELECT id, title, abstract, doi, domain, publication_date, tags, authors, pdf_filename, pdf_size,
       status, rejection_reason, reviewed_at, created_at
     FROM papers WHERE user_id = $1 ORDER BY created_at DESC`, [req.userId])
   res.json(rows)
@@ -302,7 +373,7 @@ app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
   const countParams = status === 'reviewed' ? [] : [status]
   const countWhere = status === 'reviewed' ? "status IN ('approved', 'rejected')" : 'status = $1'
   const [{ rows }, countResult] = await Promise.all([
-    pool.query(`SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.status,
+    pool.query(`SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.publication_date, p.tags, p.authors, p.status,
       p.created_at, p.reviewed_at, p.rejection_reason, submitter.name AS submitter_name,
       submitter.email AS submitter_email, reviewer.name AS reviewer_name
       FROM papers p JOIN users submitter ON submitter.id = p.user_id
@@ -317,7 +388,7 @@ app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
 app.get('/api/moderation/papers/:id', auth, requireModerator, async (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
   const { rows } = await pool.query(`
-    SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.pdf_filename,
+    SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.publication_date, p.tags, p.authors, p.pdf_filename,
       p.pdf_size, p.additional_notes, p.status, p.rejection_reason, p.created_at, p.reviewed_at,
       submitter.name AS submitter_name, submitter.email AS submitter_email,
       reviewer.name AS reviewer_name
