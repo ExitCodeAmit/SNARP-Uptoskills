@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
   House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
@@ -6,7 +6,7 @@ import {
 } from '@phosphor-icons/react'
 import { Avatar } from './components/ui'
 import { ROLE_LABEL } from './format'
-import { CONVERSATIONS, NOTIFICATIONS } from './sample'
+import { api } from './api'
 import logo from './assets/logo.png'
 
 const MAIN_NAV = [
@@ -14,8 +14,8 @@ const MAIN_NAV = [
   { to: '/communities', label: 'Communities', icon: UsersThree },
   { to: '/articles', label: 'Research papers', icon: Article },
   { to: '/events', label: 'Events', icon: CalendarBlank },
-  { to: '/messages', label: 'Messages', icon: ChatCircleDots, badge: CONVERSATIONS.filter((c) => c.unread).length },
-  { to: '/notifications', label: 'Notifications', icon: Bell, badge: NOTIFICATIONS.filter((n) => n.unread).length },
+  { to: '/messages', label: 'Messages', icon: ChatCircleDots },
+  { to: '/notifications', label: 'Notifications', icon: Bell },
   { to: '/tools', label: 'Citation tools', icon: Quotes },
 ]
 
@@ -44,9 +44,24 @@ function NavGroup({ title, items, onNavigate }) {
 export default function Layout({ user, onLogout }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const [unread, setUnread] = useState({ notifications: 0, messages: 0 })
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const close = () => setOpen(false)
+
+  useEffect(() => {
+    let active = true
+    const refresh = () => api('/notifications/unread-count').then((counts) => { if (active) setUnread(counts) }).catch(() => {})
+    refresh()
+    const interval = setInterval(refresh, 30000)
+    window.addEventListener('snarp:unread-changed', refresh)
+    return () => { active = false; clearInterval(interval); window.removeEventListener('snarp:unread-changed', refresh) }
+  }, [pathname])
+
+  const navItems = MAIN_NAV.map((item) => ({
+    ...item,
+    badge: item.to === '/messages' ? unread.messages : item.to === '/notifications' ? unread.notifications : 0,
+  }))
 
   const search = (e) => {
     e.preventDefault()
@@ -66,13 +81,13 @@ export default function Layout({ user, onLogout }) {
         </div>
 
         <div className="sidebar-scroll">
-          <NavGroup title="Discover" items={MAIN_NAV} onNavigate={close} />
+          <NavGroup title="Discover" items={navItems} onNavigate={close} />
           <NavGroup title="Workspace" items={WORK_NAV} onNavigate={close} />
           {['admin', 'moderator'].includes(user.role) && <NavGroup title="Review" items={[{ to: '/moderation', label: 'Paper moderation', icon: ShieldCheck }]} onNavigate={close} />}
         </div>
 
         <div className="sidebar-user">
-          <Avatar name={user.name} />
+          <Avatar name={user.name} src={user.avatar_url} />
           <div className="sidebar-user-info">
             <strong>{user.name}</strong>
             <span>{ROLE_LABEL[user.role]}</span>
@@ -93,15 +108,16 @@ export default function Layout({ user, onLogout }) {
             <MagnifyingGlass size={18} />
             <input
               type="search"
-              placeholder="Search papers, communities, events"
+              placeholder="Search researchers, posts, papers, communities"
               aria-label="Search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
           </form>
           <div className="topbar-actions">
-            <NavLink to="/notifications" className="icon-btn icon-btn-lg has-dot" aria-label="Notifications">
+            <NavLink to="/notifications" className={`icon-btn icon-btn-lg ${unread.notifications ? 'has-dot' : ''}`} aria-label={unread.notifications ? `Notifications, ${unread.notifications} unread` : 'Notifications'}>
               <Bell size={22} />
+              {unread.notifications > 0 && <span className="nav-badge topbar-badge">{unread.notifications}</span>}
             </NavLink>
             {pathname !== '/submit' && (
               <Link to="/submit" className="btn btn-primary">
