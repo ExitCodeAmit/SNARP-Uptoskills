@@ -6,9 +6,7 @@ import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import { sniffImage } from './image.js'
 import { DEFAULT_MAX_PDF_BYTES, validatePaperSubmission } from './paper.js'
-<<<<<<< HEAD
 import { rankRecommendations } from './recommendations.js'
-=======
 import { createSessionToken, REMEMBERED_SESSION_SECONDS, TEMPORARY_SESSION_SECONDS, verifySessionToken } from './session.js'
 import { runMigrations } from './migrate.js'
 import { validateProfileUpdate } from './profile.js'
@@ -17,7 +15,6 @@ import { validateCommunity, validateCommunityPost } from './community.js'
 import { validateMessageBody, validateRecipientId } from './messaging.js'
 import { validateEvent } from './event.js'
 import { rateLimit } from 'express-rate-limit'
->>>>>>> upstream/main
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
@@ -78,69 +75,6 @@ async function setupDb() {
     if (adminConnected) await admin.end()
   }
 
-<<<<<<< HEAD
-  const pool = new pg.Pool({ database: DB_NAME })
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id            SERIAL PRIMARY KEY,
-      name          VARCHAR(100) NOT NULL,
-      email         VARCHAR(255) NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role          VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'moderator', 'author', 'user')),
-      research_interests TEXT[] NOT NULL DEFAULT '{}',
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS research_interests TEXT[] NOT NULL DEFAULT '{}';
-    -- Post images live in Postgres as BYTEA
-    CREATE TABLE IF NOT EXISTS images (
-      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      mime       VARCHAR(20) NOT NULL,
-      data       BYTEA NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS posts (
-      id         SERIAL PRIMARY KEY,
-      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      body       TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS posts_created_at_idx ON posts (created_at DESC);
-    -- Upgrades posts tables created before image support
-    ALTER TABLE posts ADD COLUMN IF NOT EXISTS image_id UUID REFERENCES images(id) ON DELETE SET NULL;
-    ALTER TABLE posts DROP CONSTRAINT IF EXISTS posts_body_check;
-    DO $$ BEGIN
-      ALTER TABLE posts ADD CONSTRAINT posts_content_check
-        CHECK (length(body) <= 5000 AND (length(trim(body)) > 0 OR image_id IS NOT NULL));
-    EXCEPTION WHEN duplicate_object THEN NULL;
-    END $$;
-    CREATE TABLE IF NOT EXISTS papers (
-      id                 BIGSERIAL PRIMARY KEY,
-      user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title              VARCHAR(300) NOT NULL,
-      abstract           TEXT NOT NULL,
-      doi                VARCHAR(255),
-      domain             VARCHAR(120) NOT NULL,
-      publication_date   DATE,
-      tags               TEXT[] NOT NULL DEFAULT '{}',
-      authors            JSONB NOT NULL,
-      pdf_data           BYTEA NOT NULL,
-      pdf_filename       VARCHAR(255) NOT NULL,
-      pdf_content_type   VARCHAR(100) NOT NULL DEFAULT 'application/pdf' CHECK (pdf_content_type = 'application/pdf'),
-      pdf_size           INTEGER NOT NULL CHECK (pdf_size > 0 AND pdf_size <= 10485760),
-      additional_notes   TEXT,
-      status             VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-      idempotency_key    UUID,
-      created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE (user_id, idempotency_key)
-    );
-    ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
-    ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
-    ALTER TABLE papers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-    ALTER TABLE papers ADD COLUMN IF NOT EXISTS publication_date DATE;
-    CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);`)
-=======
   const pool = new pg.Pool({ database: DB_NAME, max: PG_POOL_MAX })
   try {
     await runMigrations(pool, new URL('./migrations/', import.meta.url))
@@ -148,7 +82,6 @@ async function setupDb() {
     await pool.end()
     throw err
   }
->>>>>>> upstream/main
   return pool
 }
 
@@ -331,7 +264,8 @@ app.post('/api/auth/logout', auth, async (req, res) => {
 app.get('/api/auth/me', auth, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.*, COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department,
-      COALESCE(up.research_interests, '{}') AS research_interests, COALESCE(up.bio, '') AS bio,
+      COALESCE(NULLIF(up.research_interests, '{}'::text[]), u.research_interests, '{}') AS research_interests,
+      COALESCE(up.bio, '') AS bio,
       COALESCE(up.skills, '{}') AS skills, COALESCE(up.links, '[]'::jsonb) AS links,
       (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count
      FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id WHERE u.id = $1`,
@@ -366,12 +300,30 @@ app.patch('/api/auth/profile', auth, async (req, res) => {
     }
   }
 
-  const { rows } = await pool.query(
-    'UPDATE users SET research_interests = $1 WHERE id = $2 RETURNING research_interests',
-    [normalizedInterests, req.userId]
-  )
-  if (!rows[0]) return res.status(401).json({ error: 'Please log in again' })
-  res.json({ research_interests: rows[0].research_interests })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      'UPDATE users SET research_interests = $1 WHERE id = $2 RETURNING research_interests',
+      [normalizedInterests, req.userId]
+    )
+    if (!rows[0]) {
+      await client.query('ROLLBACK')
+      return res.status(401).json({ error: 'Please log in again' })
+    }
+    await client.query(
+      `INSERT INTO user_profiles (user_id, research_interests) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET research_interests = EXCLUDED.research_interests, updated_at = now()`,
+      [req.userId, rows[0].research_interests]
+    )
+    await client.query('COMMIT')
+    res.json({ research_interests: rows[0].research_interests })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
 })
 
 app.put('/api/auth/me', auth, async (req, res) => {
@@ -388,7 +340,8 @@ app.put('/api/auth/me', auth, async (req, res) => {
   try {
     await client.query('BEGIN')
     transactionStarted = true
-    await client.query('UPDATE users SET name = $2 WHERE id = $1', [req.userId, profile.name])
+    await client.query('UPDATE users SET name = $2, research_interests = $3 WHERE id = $1',
+      [req.userId, profile.name, profile.research_interests])
     await client.query(
       `INSERT INTO user_profiles (user_id, institution, department, research_interests, bio, skills, links)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
@@ -963,19 +916,14 @@ app.get('/api/posts', auth, async (req, res) => {
         EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $3) AS liked_by_me,
         (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
-        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi, NULL::date AS publication_date
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi, NULL::text AS publication_date
       FROM posts p JOIN users u ON u.id = p.user_id
       UNION ALL
       SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
-<<<<<<< HEAD
-        COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.user_id, u.name AS author_name, u.role AS author_role,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi, rp.publication_date
-=======
         COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.updated_at, rp.user_id, u.name AS author_name, u.role AS author_role,
         CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
         0::int AS like_count, false AS liked_by_me, 0::int AS comment_count,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
->>>>>>> upstream/main
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi, rp.publication_date::text AS publication_date
       FROM papers rp JOIN users u ON u.id = rp.user_id
       WHERE rp.status = 'approved'
     ) feed ORDER BY created_at DESC, type ASC, id::bigint DESC LIMIT $1 OFFSET $2`,
@@ -1004,10 +952,6 @@ app.get('/api/posts/search', auth, async (req, res) => {
 })
 
 app.get('/api/papers/search', auth, async (req, res) => {
-  const q = String(req.query.q ?? '').trim().slice(0, 200)
-  const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
-  const { rows } = await pool.query(`
-    SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi, p.publication_date,
   const query = buildPaperDiscovery(req.query)
   const [{ rows: items }, { rows: counts }] = await Promise.all([
     pool.query(query.searchSql, query.values),
@@ -1024,19 +968,6 @@ app.get('/api/papers/categories', auth, async (_req, res) => {
   res.json(rows.map(({ domain }) => domain))
 })
 
-app.get('/api/papers/:id', auth, async (req, res) => {
-  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
-  const { rows } = await pool.query(
-    `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors,
-      p.reviewed_at, p.created_at, u.name AS submitter_name
-     FROM papers p JOIN users u ON u.id = p.user_id
-     WHERE p.id = $1 AND p.status = 'approved'`,
-    [req.params.id]
-  )
-  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
-  res.json(rows[0])
-})
-
 app.get('/api/papers/recommendations', auth, async (req, res) => {
   const profile = await pool.query('SELECT research_interests FROM users WHERE id = $1', [req.userId])
   if (!profile.rows[0]) return res.status(401).json({ error: 'Please log in again' })
@@ -1045,7 +976,8 @@ app.get('/api/papers/recommendations', auth, async (req, res) => {
   if (!interests.length) return res.json([])
 
   const { rows } = await pool.query(`
-    SELECT p.id, p.user_id, p.status, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi, p.publication_date,
+    SELECT p.id, p.user_id, p.status, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi,
+      p.publication_date::text AS publication_date,
       p.reviewed_at, p.created_at
     FROM papers p
     WHERE p.status = 'approved'
@@ -1067,6 +999,20 @@ app.get('/api/papers/recommendations', auth, async (req, res) => {
       )
     ORDER BY COALESCE(p.publication_date, p.created_at::date) DESC, p.id DESC`, [req.userId, interests])
   res.json(rankRecommendations(rows, interests, req.userId))
+})
+
+app.get('/api/papers/:id', auth, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(
+    `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors,
+      p.publication_date::text AS publication_date,
+      p.reviewed_at, p.created_at, u.name AS submitter_name
+     FROM papers p JOIN users u ON u.id = p.user_id
+     WHERE p.id = $1 AND p.status = 'approved'`,
+    [req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
+  res.json(rows[0])
 })
 
 // Multipart: "body" text plus an optional "image" file

@@ -11,6 +11,19 @@ import { apa, bibtex } from '../cite'
 import { FAQ } from '../sample'
 import { api, apiBlob } from '../api'
 
+function parseDate(value) {
+  if (!value) return null
+  const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value)
+  return Number.isFinite(date.getTime()) ? date : null
+}
+
+function formatDate(value, options) {
+  const date = parseDate(value)
+  return date ? date.toLocaleDateString(undefined, options) : 'Date unavailable'
+}
+
 function CopyButton({ text }) {
   const [done, setDone] = useState(false)
   const copy = async () => {
@@ -246,13 +259,10 @@ function PublishedPaperCard({ paper }) {
   const dateLabel = paper.publication_date
     ? 'Published'
     : paper.reviewed_at ? 'Approved' : 'Submitted'
-  const dateValue = paper.publication_date
-    ? new Date(`${paper.publication_date}T00:00:00`)
-    : new Date(paper.reviewed_at ?? paper.created_at)
+  const dateValue = parseDate(paper.publication_date || paper.reviewed_at || paper.created_at)
   return <article className="panel article">
-<<<<<<< HEAD
-    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">{dateLabel} {dateValue.toLocaleDateString()}</time></div>
-    <h3>{paper.title}</h3>
+    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">{dateLabel} {dateValue ? dateValue.toLocaleDateString() : 'Date unavailable'}</time></div>
+    <h3><Link to={`/articles/${paper.id}`}>{paper.title}</Link></h3>
     <p className="article-authors">{authorNames.join(', ')}</p>
     <p className="article-abstract">{paper.abstract}</p>
     <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
@@ -263,15 +273,7 @@ function PublishedPaperCard({ paper }) {
         <span key={interest}>{interest} ({signals.map(({ field, points }) => `${field} +${points}`).join(', ')})</span>
       ))}
     </p>}
-    <div className="article-actions"><PaperPdf paperId={paper.id} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
-=======
-    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">Approved {new Date(paper.reviewed_at ?? paper.created_at).toLocaleDateString()}</time></div>
-    <h3><Link to={`/articles/${paper.id}`}>{paper.title}</Link></h3>
-    <p className="article-authors">{authorNames.join(', ')}</p>
-    <p className="article-abstract">{paper.abstract}</p>
-    <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
     <div className="article-actions"><Link className="btn btn-ghost btn-sm" to={`/articles/${paper.id}`}>Details</Link><PaperPdf paperId={paper.id} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
->>>>>>> upstream/main
   </article>
 }
 
@@ -291,7 +293,7 @@ export function PaperDetail() {
   if (!paper) return <div className="page"><div className="panel empty" aria-busy="true">Loading paper…</div></div>
   const authors = (paper.authors ?? []).map((author) => typeof author === 'string' ? author : [author.name, author.affiliation].filter(Boolean).join(' · '))
   return <div className="page">
-    <PageHeader title={paper.title} sub={`${paper.domain} · Approved ${new Date(paper.reviewed_at ?? paper.created_at).toLocaleDateString()}`} />
+    <PageHeader title={paper.title} sub={`${paper.domain} · Approved ${formatDate(paper.reviewed_at ?? paper.created_at)}`} />
     <article className="panel paper-detail">
       <h2>Authors</h2><p className="article-authors">{authors.join(', ')}</p>
       <p className="muted-sm">Submitted by {paper.submitter_name}</p>
@@ -1050,43 +1052,6 @@ function Toggle({ label, defaultOn }) {
   )
 }
 
-export function Settings({ user }) {
-  const [interests, setInterests] = useState('')
-  const [profileLoading, setProfileLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [profileError, setProfileError] = useState('')
-  const [saved, setSaved] = useState(false)
-
-  useEffect(() => {
-    let active = true
-    api('/auth/me')
-      .then((profile) => {
-        if (active) setInterests((profile.research_interests ?? []).join(', '))
-      })
-      .catch((err) => {
-        if (active) setProfileError(err.message)
-      })
-      .finally(() => {
-        if (active) setProfileLoading(false)
-      })
-    return () => { active = false }
-  }, [])
-
-  const saveProfile = async (e) => {
-    e.preventDefault()
-    setSaving(true)
-    setProfileError('')
-    setSaved(false)
-    try {
-      const researchInterests = interests.split(/[,\n]/).map((interest) => interest.trim()).filter(Boolean)
-      const result = await api('/auth/profile', {
-        method: 'PATCH',
-        body: { research_interests: researchInterests },
-      })
-      setInterests(result.research_interests.join(', '))
-      setSaved(true)
-    } catch (err) {
-      setProfileError(err.message)
 export function Settings({ user, onUserUpdate }) {
   const [profile, setProfile] = useState(() => ({
     name: user.name ?? '',
@@ -1097,12 +1062,36 @@ export function Settings({ user, onUserUpdate }) {
     skills: user.skills ?? [],
     links: user.links ?? [],
   }))
+  const [profileLoading, setProfileLoading] = useState(true)
   const [saved, setSaved] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [saving, setSaving] = useState(false)
   const [photoError, setPhotoError] = useState('')
   const [photoSaving, setPhotoSaving] = useState(false)
   const photoInput = useRef(null)
+
+  useEffect(() => {
+    let active = true
+    api('/auth/me')
+      .then((current) => {
+        if (active) {
+          setProfile((previous) => ({
+            ...previous,
+            ...current,
+            research_interests: current.research_interests ?? [],
+            skills: current.skills ?? [],
+            links: current.links ?? [],
+          }))
+        }
+      })
+      .catch((err) => {
+        if (active) setSaveError(err.message)
+      })
+      .finally(() => {
+        if (active) setProfileLoading(false)
+      })
+    return () => { active = false }
+  }, [])
 
   const setField = (field, value) => {
     setSaved(false)
@@ -1119,13 +1108,14 @@ export function Settings({ user, onUserUpdate }) {
         method: 'PUT',
         body: {
           ...profile,
-          research_interests: typeof profile.research_interests === 'string'
-            ? profile.research_interests.split(',')
-            : profile.research_interests,
-          skills: typeof profile.skills === 'string' ? profile.skills.split(',') : profile.skills,
-          links: profile.links.filter((link) => link.label.trim() || link.url.trim()),
+          research_interests: Array.isArray(profile.research_interests)
+            ? profile.research_interests
+            : profile.research_interests.split(/[,\n]/),
+          skills: Array.isArray(profile.skills) ? profile.skills : profile.skills.split(/[,\n]/),
+          links: profile.links.filter((link) => link.label.trim() && link.url.trim()),
         },
       })
+      setProfile((current) => ({ ...current, ...updated }))
       onUserUpdate(updated)
       setSaved(true)
     } catch (err) {
@@ -1135,12 +1125,6 @@ export function Settings({ user, onUserUpdate }) {
     }
   }
 
-<<<<<<< HEAD
-  return (
-    <div className="page">
-      <PageHeader title="Settings" sub="Manage your profile and notification preferences." />
-      <form className="panel form-panel" onSubmit={saveProfile}>
-=======
   const uploadPhoto = async (event) => {
     const file = event.target.files?.[0]
     event.target.value = ''
@@ -1169,8 +1153,7 @@ export function Settings({ user, onUserUpdate }) {
       <PageHeader title="Settings" sub="Manage your profile and notification preferences." />
       {saved && <p className="notice" role="status">Profile updated.</p>}
       {saveError && <p className="alert" role="alert">{saveError}</p>}
-      {profile && <form className="panel form-panel" onSubmit={saveProfile}>
->>>>>>> upstream/main
+      <form className="panel form-panel" onSubmit={saveProfile}>
         <h3 className="form-title">Profile</h3>
         <div className="settings-avatar">
           <Avatar name={user.name} size="lg" src={user.avatar_url} />
@@ -1210,25 +1193,13 @@ export function Settings({ user, onUserUpdate }) {
           <input id="s-department" maxLength={160} value={profile.department} onChange={(e) => setField('department', e.target.value)} placeholder="Department or faculty" />
         </div>
         <div className="field">
-<<<<<<< HEAD
-          <label htmlFor="s-interests">Research interests</label>
-          <textarea
-            id="s-interests"
-            rows={3}
-            value={interests}
-            onChange={(e) => { setInterests(e.target.value); setSaved(false) }}
-            placeholder="Artificial Intelligence, Machine Learning, Data Science"
-            aria-describedby="s-interests-help"
-            disabled={profileLoading || saving}
-          />
-          <span id="s-interests-help" className="muted-sm">Separate interests with commas or new lines. Add up to 20.</span>
-=======
           <label htmlFor="s-bio">Bio</label>
           <textarea id="s-bio" rows={3} maxLength={2000} value={profile.bio} onChange={(e) => setField('bio', e.target.value)} placeholder="A line about your research interests" />
         </div>
         <div className="field">
           <label htmlFor="s-interests">Research interests</label>
-          <input id="s-interests" maxLength={1600} value={Array.isArray(profile.research_interests) ? profile.research_interests.join(', ') : profile.research_interests} onChange={(e) => setField('research_interests', e.target.value)} placeholder="AI, education, biology" />
+          <textarea id="s-interests" rows={3} maxLength={1600} value={Array.isArray(profile.research_interests) ? profile.research_interests.join(', ') : profile.research_interests} onChange={(e) => setField('research_interests', e.target.value)} placeholder="Artificial Intelligence, Machine Learning, Data Science" aria-describedby="s-interests-help" disabled={profileLoading || saving} />
+          <span id="s-interests-help" className="muted-sm">Separate interests with commas or new lines. Add up to 20.</span>
         </div>
         <div className="field">
           <label htmlFor="s-skills">Skills and expertise</label>
@@ -1242,25 +1213,16 @@ export function Settings({ user, onUserUpdate }) {
             <button type="button" className="link-danger" onClick={() => setField('links', profile.links.filter((_, i) => i !== index))}>Remove</button>
           </div>)}
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setField('links', [...profile.links, { label: '', url: '' }])} disabled={profile.links.length >= 5}>Add link</button>
->>>>>>> upstream/main
         </div>
-        {profileError && <p className="alert" role="alert">{profileError}</p>}
-        {saved && <p className="notice" role="status">Research interests saved.</p>}
-        <p className="muted-sm">Other profile fields and notification preferences are not saved yet.</p>
+        <p className="muted-sm">Notification preferences are not saved yet.</p>
         <button className="btn btn-primary" type="submit" disabled={profileLoading || saving}>
-          {profileLoading ? 'Loading profile…' : saving ? 'Saving…' : 'Save research interests'}
+          {profileLoading ? 'Loading profile…' : saving ? 'Saving…' : 'Save profile'}
         </button>
         <h3 className="form-title">Notifications</h3>
-        <p className="muted-sm">Notification preferences are not saved yet.</p>
         <Toggle label="Email me when my paper is reviewed" defaultOn />
         <Toggle label="Comments on my posts" defaultOn />
         <Toggle label="New members in my communities" />
-<<<<<<< HEAD
       </form>
-=======
-        <button className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save profile'}</button>
-      </form>}
->>>>>>> upstream/main
     </div>
   )
 }
@@ -1295,7 +1257,10 @@ export function Search() {
   const [communities, setCommunities] = useState([])
   const [events, setEvents] = useState([])
   const [paperError, setPaperError] = useState('')
-<<<<<<< HEAD
+  const [userError, setUserError] = useState('')
+  const [postError, setPostError] = useState('')
+  const [communityError, setCommunityError] = useState('')
+  const [eventError, setEventError] = useState('')
   const [recommendations, setRecommendations] = useState([])
   const [recommendationLoading, setRecommendationLoading] = useState(true)
   const [recommendationError, setRecommendationError] = useState(null)
@@ -1324,12 +1289,6 @@ export function Search() {
     setRecommendationRequest((request) => request + 1)
   }
 
-=======
-  const [userError, setUserError] = useState('')
-  const [postError, setPostError] = useState('')
-  const [communityError, setCommunityError] = useState('')
-  const [eventError, setEventError] = useState('')
->>>>>>> upstream/main
   useEffect(() => {
     if (!query.trim()) return
     let active = true

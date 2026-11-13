@@ -40,7 +40,7 @@ export function buildPaperDiscovery({ q = '', author = '', domain = '', tag = ''
   return {
     countSql: `SELECT count(*)::int AS total FROM papers p JOIN users u ON u.id = p.user_id WHERE ${where}`,
     countValues,
-    searchSql: `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors,
+    searchSql: `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.publication_date::text AS publication_date, p.tags, p.authors,
       p.reviewed_at, p.created_at, u.name AS submitter_name
       FROM papers p JOIN users u ON u.id = p.user_id
       WHERE ${where}

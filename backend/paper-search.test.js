@@ -5,6 +5,7 @@ import { buildPaperDiscovery } from './paper-search.js'
 test('builds approved-only paper discovery filters with bound values', () => {
   const query = buildPaperDiscovery({ q: 'AI_%', author: 'Asha', domain: 'Education', tag: 'NLP' })
   assert.match(query.searchSql, /p\.status = 'approved'/)
+  assert.match(query.searchSql, /p\.publication_date::text AS publication_date/)
   assert.match(query.searchSql, /p\.authors::text ILIKE \$2/)
   assert.match(query.searchSql, /lower\(p\.domain\) = lower\(\$3\)/)
   assert.match(query.searchSql, /unnest\(p\.tags\)/)
