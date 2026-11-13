@@ -41,6 +41,11 @@ This README describes the project **as it stands today**: what works end to end,
 | Messages | Implemented MVP | Private one-to-one conversations persist; active threads refresh periodically |
 | Notifications | Implemented MVP | Persisted like, comment, paper-review and message alerts with unread/read state |
 | Submit a paper | Implemented MVP | Authenticated submissions save metadata and PDF bytes in PostgreSQL; new papers are pending |
+| Paper moderation | Implemented MVP | Admin/Moderator dashboard persists approval and rejection details |
+| Settings, Help center | Partial | Research interests save to the profile; other settings are UI only |
+| Search bar | Partial | Approved papers are searched from PostgreSQL; communities and events remain sample data |
+| Personalized paper recommendations | Implemented MVP | Approved papers are ranked using saved research interests |
+| Like / Comment / Share on posts | 🎨 UI only | Like toggles locally and resets on refresh |
 | Paper moderation | Implemented MVP | Admin/Moderator dashboard includes submission/report queues, summary counts and review history |
 | Settings, Help center | Partial | Profile photo uploads persist; other profile settings are UI only. FAQ and contact details are real |
 | Search bar | Partial | Researchers, posts, communities, upcoming events and approved papers use PostgreSQL |
@@ -191,7 +196,20 @@ Open **http://localhost:5173**, create an account, and post.
 | frontend | `npm test` | Citation helper tests |
 | backend | `npm start` | Start the API |
 | backend | `npm run dev` | Start the API with auto-restart |
-| backend | `npm test` | Validation, session, discovery and migration-runner unit tests |
+| backend | `npm run seed:demo` | Seed synthetic recommendation examples through local submission and moderation APIs (development only) |
+| backend | `npm test` | Validation, sessions, discovery, migration, recommendation and image-signature tests |
+
+### Seed recommendation demo data
+
+Start PostgreSQL and the backend first. In a separate PowerShell terminal in `backend`, explicitly enable the local-only seed and run it:
+
+```powershell
+$env:NODE_ENV = 'development'
+$env:ALLOW_DEMO_SEED = 'true'
+npm run seed:demo
+```
+
+The repeatable seed submits ten synthetic papers, with valid demonstration PDFs, under clearly marked demo accounts and approves them through the existing moderation API. Their tags and notes identify them as `DEMO DATA`; their dates are illustrative only, and they have no DOI or real-person authors. The seed refuses production mode, production-named databases, and non-local PostgreSQL hosts. It does not update or remove existing records. After seeding, save interests from **Settings** using the existing profile form, then open `/search`.
 
 ### Resetting the postgres password
 
@@ -239,6 +257,7 @@ erDiagram
         VARCHAR(255) email "NOT NULL, UNIQUE"
         TEXT password_hash "bcrypt hash"
         VARCHAR(20) role "admin | moderator | author | user"
+        TEXT[] research_interests "NOT NULL, default empty list"
         TIMESTAMPTZ created_at "DEFAULT now()"
     }
 
@@ -378,6 +397,7 @@ erDiagram
         TEXT abstract "NOT NULL"
         VARCHAR(255) doi "nullable"
         VARCHAR(120) domain "NOT NULL"
+        DATE publication_date "nullable"
         TEXT[] tags
         JSONB authors
         BYTEA pdf_data "PDF, maximum 10 MB"
@@ -403,6 +423,7 @@ erDiagram
 | `email` | `VARCHAR(255)` | Not null, unique, stored lowercase |
 | `password_hash` | `TEXT` | bcrypt hash (cost 10), never returned by the API |
 | `role` | `VARCHAR(20)` | `admin`, `moderator`, `author` or `user`, default `user` |
+| `research_interests` | `TEXT[]` | Saved recommendation topics; defaults to an empty list |
 | `created_at` | `TIMESTAMPTZ` | Default `now()` |
 
 Sign-up only allows `user` or `author`. Admins and moderators must be promoted in the database:
@@ -468,6 +489,7 @@ Migration `001_initial_schema.sql` creates this table if it does not exist. It s
 | `user_id` | `INTEGER` | References `users(id)`, cascade delete |
 | `title`, `abstract`, `domain` | `VARCHAR` / `TEXT` | Required paper metadata |
 | `doi` | `VARCHAR(255)` | Optional validated DOI |
+| `publication_date` | `DATE` | Optional date supplied with the submission |
 | `tags` | `TEXT[]` | Research keywords |
 | `authors` | `JSONB` | Author names and optional affiliations |
 | `pdf_data` | `BYTEA` | Validated PDF content, up to 10 MB |
@@ -483,7 +505,7 @@ The optional `PAPER_MAX_PDF_BYTES` setting can lower the server upload limit; it
 
 ### Upgrades
 
-Databases created by earlier versions of this project are upgraded by the first migration: the `image_id` and profile-photo columns are added when missing, the old post constraint is replaced, paper review columns and auth sessions are added, and indexes are created. Migration `002_profiles_and_social_feed.sql` adds profile fields, post timestamps, likes, comments and reports. Migration `003_moderation_dashboards.sql` adds durable paper review history and the admin audit log. Migration `004_communities.sql` adds communities, membership and discussions. Migration `005_messages_notifications.sql` adds private conversations, messages and notifications. Migration `006_events.sql` adds events and capacity-aware registrations. Migration `007_user_timeline_indexes.sql` adds indexes for user timelines and submission history. The migration runner wraps each file and its version record in a transaction. Review any future migration for data compatibility before deploying it.
+Databases created by earlier versions of this project are upgraded by ordered migrations. Migration `001_initial_schema.sql` safely adds missing image, post, paper-review and auth-session schema without deleting rows. Migration `002_profiles_and_social_feed.sql` adds profile fields, post timestamps, likes, comments and reports. Migration `003_moderation_dashboards.sql` adds durable paper review history and the admin audit log. Migration `004_communities.sql` adds communities, membership and discussions. Migration `005_messages_notifications.sql` adds private conversations, messages and notifications. Migration `006_events.sql` adds events and capacity-aware registrations. Migration `007_user_timeline_indexes.sql` adds indexes for user timelines and submission history. Migration `008_recommendation_profile_fields.sql` adds research interests and publication dates and copies existing profile interests into the recommendation field when needed. The migration runner wraps each file and its version record in a transaction; no existing data is dropped or reset.
 
 ---
 
@@ -503,6 +525,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `GET` | `/auth/me` | Yes | | `200 { id, name, email, role, created_at, avatar_url, institution, department, research_interests, bio, skills, links, post_count }` |
 | `PUT` | `/auth/me` | Yes | JSON profile fields: `name`, `institution`, `department`, `bio`, `research_interests[]`, `skills[]`, `links[]` | Updated profile |
 | `PUT` | `/auth/me/photo` | Yes | `multipart/form-data`: `photo` (JPEG, PNG, GIF or WebP, max 5 MB) | `200 { avatar_url }` |
+| `PATCH` | `/auth/profile` | Yes | JSON `{ research_interests: string[] }` (up to 20 interests, 100 characters each) | `200 { research_interests }` |
 | `GET` | `/users/search?q=...` | Yes | | Up to 20 matching public researcher profiles |
 | `GET` | `/users/:id` | Yes | Optional `post` query to include a shared older post | Public profile and up to 20 posts; email is not included |
 | `GET` | `/posts?page=1` | Yes | Optional page number | `{ items, page, hasMore }`; 20 mixed posts/papers per page |
@@ -539,11 +562,12 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `POST` | `/communities/:id/posts` | Member | JSON `{ body }` | `201 discussion post` |
 | `DELETE` | `/communities/:communityId/posts/:postId` | Author/Community owner/Moderator | | `204` |
 | `GET` | `/images/:uuid` | No | | Image bytes with the correct `Content-Type` |
-| `POST` | `/papers/submit` | Author | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, JSON `tags`, JSON `authors`, optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
+| `POST` | `/papers/submit` | Author | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, optional `publicationDate` (`YYYY-MM-DD`), JSON `tags`, JSON `authors`, optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
 | `GET` | `/papers/my-submissions` | Yes | | Own submissions and review status/rejection reason only |
 | `GET` | `/papers/search?q=...&author=...&domain=...&tag=...&sort=newest&page=1&limit=20` | Yes | All filters are optional; `sort` is `newest`, `oldest`, `title_asc`, or `title_desc`; `limit` is capped at 50 | `{ items, page, limit, total, hasMore }`; approved papers only |
 | `GET` | `/papers/categories` | Yes | | Distinct categories used by approved papers |
 | `GET` | `/papers/:id` | Yes | | Approved paper metadata and abstract; never includes PDF bytes or review notes |
+| `GET` | `/papers/recommendations` | Yes | | Up to 10 approved papers with score and matching factors, ranked against saved research interests |
 | `GET` | `/papers/:id/pdf` | Yes | | PDF bytes for the submitting user, Admin/Moderator, or any authenticated user after approval |
 | `GET` | `/moderation/papers?status=pending` | Moderator/Admin | Optional `status` (`pending`, `approved`, `rejected`, `reviewed`), `page`, `limit` | Paper metadata plus pagination; no PDF bytes |
 | `GET` | `/moderation/papers/:id` | Moderator/Admin | | Full review metadata |
@@ -554,7 +578,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `PATCH` | `/moderation/papers/:id/reject` | Moderator/Admin | JSON `{ "reason": "..." }` | Atomic pending → rejected decision with reviewer, history and audit record |
 | `GET` | `/admin/audit-logs?page=1&limit=50` | Admin | Optional page/limit | Paginated moderation audit records |
 
-Paper discovery supports title/abstract/DOI/author/domain/tag matching, exact category filtering, four sort orders and bounded page-based pagination. The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; discovery and detail queries filter to `approved` in SQL.
+Paper discovery supports title/abstract/DOI/author/domain/tag matching, exact category filtering, four sort orders and bounded page-based pagination. Recommendations award +3 for an exact tag match, +4 for a domain match, +2 for a title match, and +1 for an abstract match per distinct saved interest. The authenticated endpoint excludes the requesting user's papers and all non-approved papers, removes duplicates, returns at most ten results, and uses publication date (or submission date if unavailable) to break score ties. Each result includes `score` and `matched_interests` with matching fields and point values. The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; discovery and detail queries filter to `approved` in SQL.
 
 **Example: submit a paper with curl**
 
@@ -644,6 +668,9 @@ SNARP-Uptoskills/
 │   ├── session.js            Session-bound JWT helpers
 │   ├── image.js              Detects real image type from file bytes
 │   ├── image.test.js         Tests for image.js
+│   ├── recommendations.js    Paper recommendation scoring and ranking
+│   ├── recommendations.test.js Tests for recommendation scoring and ranking
+│   ├── seed-demo-papers.js   Development-only demo data via submission and moderation APIs
 │   ├── .env.example          Template for backend/.env (copy and fill in)
 │   ├── package.json
 │   └── package-lock.json
@@ -785,6 +812,7 @@ Remaining roadmap work, following `social_Academic_Research_Platform_Roadmap.doc
 - [ ] Upgrade message polling to Socket.IO for real-time delivery
 - [ ] PostgreSQL full-text search
 - [ ] Settings: update password and persist notification preferences
+- [ ] Editing posts and pagination beyond the latest 50
 - [ ] Cursor-based feed pagination for consistent pages as new posts arrive
 - [ ] Shared rate-limit storage before running multiple API instances
 - [ ] Forgot password flow

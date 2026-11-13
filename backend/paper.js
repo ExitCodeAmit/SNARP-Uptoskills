@@ -18,10 +18,21 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function publicationDate(value) {
+  const date = text(value)
+  if (!date) return null
+  const parsed = new Date(`${date}T00:00:00Z`)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+    throw Object.assign(new Error('Enter a valid publication date'), { field: 'publicationDate' })
+  }
+  return date
+}
+
 export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_PDF_BYTES) {
   const title = text(fields.title)
   const abstract = text(fields.abstract)
   const domain = text(fields.domain)
+  const publishedOn = publicationDate(fields.publicationDate)
   const doiInput = text(fields.doi)
   const doi = doiInput.replace(/^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)/i, '')
   const additionalNotes = text(fields.additionalNotes)
@@ -79,6 +90,7 @@ export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_
     abstract,
     doi: doi || null,
     domain,
+    publicationDate: publishedOn,
     tags,
     authors,
     additionalNotes: additionalNotes || null,
