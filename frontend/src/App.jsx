@@ -1,15 +1,22 @@
-import { useState, useEffect, lazy, Suspense } from 'react'
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react'
 import {
   BrowserRouter,
   Routes,
   Route,
   Navigate,
+  useLocation,
+  useSearchParams,
 } from 'react-router-dom'
 
-import { api, getToken, saveToken, clearToken } from './api'
+import { api, getToken, saveToken, clearToken, isAdminArea } from './api'
+import { clearTheme } from './theme'
 import Auth from './Auth'
+import VerifyEmail from './VerifyEmail'
+import ResetPassword from './ResetPassword'
+import { safeNext } from './password'
 import Layout from './Layout'
 import Feed from './Feed'
+import Reels from './Reels'
 
 import {
   Communities,
@@ -21,30 +28,58 @@ import {
   Notifications,
   Tools,
   Submit,
-  Moderation,
   MySubmissions,
   Settings,
   Help,
   Search,
   UserProfile,
   PaperDetail,
+  SavedPapers,
 } from './pages'
+import { ReviewQueue, ReviewWorkspace, SubmissionFeedback } from './pages/review'
+import { AccessDenied, ModeratorDashboard } from './pages/admin'
 
-// Load the landing page only when required
+const DocsHome = lazy(() => import('./docs/DocsHome'))
+const DocsEditor = lazy(() => import('./docs/DocsEditor'))
+const docsFallback = <div className="page"><div className="panel empty" aria-busy="true">Loading Docs…</div></div>
+
+function GuestOnly({ user, children }) {
+  const [params] = useSearchParams()
+  return user ? <Navigate to={safeNext(params.get('next'))} replace /> : children
+}
+
+function RedirectToLogin() {
+  const { pathname, search } = useLocation()
+  const target = `${pathname}${search}`
+  return <Navigate to={target === '/' ? '/login' : `/login?next=${encodeURIComponent(target)}`} replace />
+}
+
 const Landing = lazy(() => import('./Landing'))
+const AdminApp = lazy(() => import('./admin/AdminApp'))
 
 export default function App() {
+  if (isAdminArea()) return <Suspense fallback={null}><AdminApp /></Suspense>
+  return <SiteApp />
+}
+
+function SiteApp() {
   const [user, setUser] = useState(null)
   const [checking, setChecking] = useState(() => !!getToken())
 
-  // Restore the user session from the saved token
+  useEffect(() => {
+    const blocked = () => { clearToken(); setUser(null) }
+    window.addEventListener('snarp:account-blocked', blocked)
+    return () => window.removeEventListener('snarp:account-blocked', blocked)
+  }, [])
+
   useEffect(() => {
     if (!getToken()) return
 
     api('/auth/me')
       .then(setUser)
       .catch((err) => {
-        if (err.status === 401) {
+        clearTheme()
+        if (err.status === 401 || err.code === 'account_blocked') {
           clearToken()
         }
       })
@@ -53,44 +88,43 @@ export default function App() {
       })
   }, [])
 
-  // Handle successful authentication
-  const onAuth = ({ token, user }, remember = true) => {
+  const onAuth = useCallback(({ token, user }, remember = true) => {
     saveToken(token, remember)
     setUser(user)
-  }
+  }, [])
 
-  // Log out the current user
   const logout = async () => {
     try {
       await api('/auth/logout', { method: 'POST' })
     } catch {
-      // Clear the browser session even if the API cannot be reached.
     }
     clearToken()
     setUser(null)
   }
 
-  // Wait until session restoration is complete
+  const accountDeleted = () => {
+    clearToken()
+    setUser(null)
+  }
+
   if (checking) {
     return null
   }
 
-  // Redirect authenticated users away from login/signup
-  const guest = (mode) =>
-    user ? (
-      <Navigate to="/" replace />
-    ) : (
+  const guest = (mode) => (
+    <GuestOnly user={user}>
       <Auth key={mode} mode={mode} onAuth={onAuth} />
-    )
+    </GuestOnly>
+  )
 
   return (
     <BrowserRouter>
       <Routes>
-        {/* Authentication routes */}
         <Route path="/login" element={guest('login')} />
         <Route path="/signup" element={guest('signup')} />
+        <Route path="/verify-email" element={<VerifyEmail onAuth={onAuth} />} />
+        <Route path="/reset-password" element={<ResetPassword />} />
 
-        {/* Authenticated application routes */}
         {user ? (
           <Route element={<Layout user={user} onLogout={logout} />}>
             <Route
@@ -98,30 +132,37 @@ export default function App() {
               element={<Feed user={user} onLogout={logout} />}
             />
 
+            <Route path="/reels" element={<Reels user={user} />} />
+            <Route path="/docs" element={<Suspense fallback={docsFallback}><DocsHome user={user} /></Suspense>} />
+            <Route path="/docs/:documentId" element={<Suspense fallback={docsFallback}><DocsEditor user={user} /></Suspense>} />
             <Route path="/communities" element={<Communities />} />
             <Route path="/communities/:id" element={<CommunityDetail user={user} />} />
             <Route path="/articles" element={<Articles />} />
-            <Route path="/articles/:id" element={<PaperDetail />} />
+            <Route path="/articles/:id" element={<PaperDetail user={user} onLogout={logout} />} />
+            <Route path="/saved" element={<SavedPapers />} />
             <Route path="/events" element={<Events user={user} />} />
             <Route path="/events/:id" element={<EventDetail user={user} />} />
             <Route path="/messages" element={<Messages user={user} />} />
-            <Route path="/notifications" element={<Notifications />} />
+            <Route path="/notifications" element={<Notifications user={user} />} />
             <Route path="/tools" element={<Tools />} />
-            <Route path="/submit" element={<Submit user={user} />} />
-            <Route path="/moderation" element={<Moderation user={user} />} />
+            <Route path="/submit" element={<Submit user={user} onUserUpdate={setUser} />} />
+            <Route path="/moderation" element={<Navigate to="/moderator" replace />} />
+            <Route path="/moderator" element={['admin', 'moderator'].includes(user.role) ? <ModeratorDashboard /> : <AccessDenied title="Moderator dashboard" text="This area is only for moderators and the Super Admin." />} />
             <Route path="/my-submissions" element={<MySubmissions />} />
+            <Route path="/my-submissions/:id" element={<SubmissionFeedback user={user} />} />
+            <Route path="/reviews" element={<ReviewQueue />} />
+            <Route path="/reviews/:id" element={<ReviewWorkspace user={user} />} />
 
             <Route
               path="/settings"
-              element={<Settings user={user} onUserUpdate={setUser} />}
+              element={<Settings user={user} onUserUpdate={setUser} onAccountDeleted={accountDeleted} />}
             />
 
             <Route path="/help" element={<Help />} />
-            <Route path="/search" element={<Search />} />
-            <Route path="/users/:id" element={<UserProfile />} />
+            <Route path="/search" element={<Search user={user} onLogout={logout} />} />
+            <Route path="/users/:id" element={<UserProfile user={user} onLogout={logout} />} />
           </Route>
         ) : (
-          // Landing page for logged-out visitors
           <Route
             path="/"
             element={
@@ -132,15 +173,9 @@ export default function App() {
           />
         )}
 
-        {/* Handle unknown routes */}
         <Route
           path="*"
-          element={
-            <Navigate
-              to={user ? '/' : '/login'}
-              replace
-            />
-          }
+          element={user ? <Navigate to="/" replace /> : <RedirectToLogin />}
         />
       </Routes>
     </BrowserRouter>

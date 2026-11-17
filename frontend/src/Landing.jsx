@@ -14,15 +14,13 @@ import {
 } from '@hugeicons/core-free-icons'
 import { initials } from './format'
 import { apa, bibtex } from './cite'
-import { ARTICLES } from './sample'
+import { EXAMPLE_PAPER } from './content'
 import logo from './assets/logo.png'
 import './Landing.css'
 
 gsap.registerPlugin(ScrollTrigger, ScrollSmoother, SplitText, DrawSVGPlugin, Flip)
 
 const Icon = ({ icon, size = 22 }) => <HugeiconsIcon icon={icon} size={size} strokeWidth={1.8} />
-
-/* ---------- Content ---------- */
 
 const ROTATOR = [
   { text: 'readers.', bg: '#c2481a', fg: '#ffffff' },
@@ -33,7 +31,7 @@ const ROTATOR = [
 
 const MARQUEE = ['Post updates', 'Publish papers', 'Get reviewed', 'Join communities', 'Cite instantly', 'Message peers']
 
-const PAPER = ARTICLES[1]
+const PAPER = EXAMPLE_PAPER
 const APA_TEXT = apa(PAPER)
 const BIB_TEXT = bibtex(PAPER)
 
@@ -94,8 +92,6 @@ const STEPS = [
   { verb: 'Get cited.', tone: 'ink', icon: QuoteDownIcon, text: 'Peers find your work through search and communities, then read it and cite it.' },
 ]
 
-/* ---------- Research network (hero visual) ---------- */
-
 const C = { x: 280, y: 280 }
 const polar = (r, deg) => ({ x: C.x + r * Math.cos((deg * Math.PI) / 180), y: C.y + r * Math.sin((deg * Math.PI) / 180) })
 
@@ -124,7 +120,6 @@ const EDGES = [
   [RING[5], RING[7]],
 ]
 
-// Packets: "out" = your work reaching a peer, "in" = a peer citing you back
 const TRIPS = [[0, 'out'], [2, 'out'], [5, 'in'], [3, 'out'], [7, 'out'], [1, 'in'], [4, 'out'], [6, 'out'], [2, 'in'], [5, 'out']]
 
 function NetworkGraph() {
@@ -168,8 +163,6 @@ function NetworkGraph() {
     </svg>
   )
 }
-
-/* ---------- Feature card visuals ---------- */
 
 function Visual({ kind }) {
   if (kind === 'photos') {
@@ -240,14 +233,11 @@ function Visual({ kind }) {
   )
 }
 
-/* ---------- Page ---------- */
-
 export default function Landing() {
   const root = useRef(null)
   const wrapper = useRef(null)
   const content = useRef(null)
 
-  // Anchor links scroll through the smoother when it is active
   const go = (e, id) => {
     e.preventDefault()
     const el = document.getElementById(id)
@@ -260,7 +250,6 @@ export default function Landing() {
     const ctx = gsap.context(() => {
       const mm = gsap.matchMedia()
 
-      // Content is fully visible without JS; everything below only runs when motion is allowed
       mm.add(
         {
           motion: '(prefers-reduced-motion: no-preference)',
@@ -284,11 +273,9 @@ export default function Landing() {
             return s
           }
 
-          // Smooth scrolling must exist before any other ScrollTrigger
           const smoother = ScrollSmoother.create({ wrapper: wrapper.current, content: content.current, smooth: 1.15, effects: true, smoothTouch: false })
           cleanups.push(() => smoother.kill())
 
-          // Nav hides while scrolling down, returns on the way up
           const nav = q('.l-nav')
           ScrollTrigger.create({
             start: 140,
@@ -298,7 +285,6 @@ export default function Landing() {
           })
           cleanups.push(() => nav.classList.remove('is-hidden'))
 
-          /* Hero entrance */
           const title = split('.hero-title .hl', { type: 'words,chars', mask: 'words' })
           gsap.set(['.g-node', '.g-center', '.g-dot'], { transformOrigin: '50% 50%' })
           gsap.timeline({ defaults: { ease: 'expo.out' } })
@@ -316,7 +302,6 @@ export default function Landing() {
           gsap.to('.g-guide-2', { rotation: -360, svgOrigin: `${C.x} ${C.y}`, duration: 120, repeat: -1, ease: 'none' })
           gsap.to('.g-halo', { scale: 1.12, svgOrigin: `${C.x} ${C.y}`, duration: 1.8, repeat: -1, yoyo: true, ease: 'sine.inOut', delay: 1.6 })
 
-          // Packets travel the network on a loop; arrivals pulse the node and show what happened
           const packets = gsap.utils.toArray('.g-packet')
           const nodes = gsap.utils.toArray('.g-node')
           const labels = gsap.utils.toArray('.g-label:not(.g-center-label)')
@@ -336,7 +321,6 @@ export default function Landing() {
               .to(label, { opacity: 0, y: -8, duration: 0.3 }, at + 2.2)
           })
 
-          // Rotating word: measure once fonts are in, then morph width and colour per word
           let alive = true
           cleanups.push(() => { alive = false })
           document.fonts.ready.then(() => {
@@ -355,13 +339,11 @@ export default function Landing() {
                 const next = (i + 1) % words.length
                 tl.to(rot, { width: widths[next], backgroundColor: ROTATOR[next].bg, duration: 0.75, ease: 'expo.inOut' }, '+=1.9')
                   .to(w, { yPercent: -115, duration: 0.75, ease: 'expo.inOut' }, '<')
-                  // immediateRender off, or the final step (back to word 0) would hide word 0 at build time
                   .fromTo(words[next], { yPercent: 115 }, { yPercent: 0, duration: 0.75, ease: 'expo.inOut', immediateRender: false }, '<')
               })
             })
           })
 
-          // Graph tilts toward the pointer
           if (fine) {
             const hero = q('.hero')
             const tilt = q('.graph-tilt')
@@ -375,7 +357,6 @@ export default function Landing() {
             on(hero, 'pointerleave', () => { rx(0); ry(0) })
           }
 
-          /* Marquee: constant drift, speeds up and leans with scroll velocity */
           const drift = gsap.to('.mq-track', { xPercent: -50, ease: 'none', duration: 34, repeat: -1 })
           const lean = gsap.quickTo('.mq-skew', 'skewX', { duration: 0.5, ease: 'power3.out' })
           ScrollTrigger.create({
@@ -391,7 +372,6 @@ export default function Landing() {
             },
           })
 
-          /* Section headings rise line by line */
           gsap.utils.toArray('.split-lines').forEach((el) => {
             const s = split(el, { type: 'lines', mask: 'lines' })
             gsap.from(s.lines, { yPercent: 105, duration: 1.1, stagger: 0.1, ease: 'expo.out', scrollTrigger: { trigger: el, start: 'top 86%', once: true } })
@@ -400,7 +380,6 @@ export default function Landing() {
             gsap.from(el, { y: 30, opacity: 0, duration: 1, ease: 'expo.out', scrollTrigger: { trigger: el, start: 'top 88%', once: true } })
           })
 
-          /* Feature cards: pinned stack on desktop, each new card buries the last */
           const cards = gsap.utils.toArray('.stack-card')
           if (wide) {
             const last = cards[cards.length - 1]
@@ -433,7 +412,6 @@ export default function Landing() {
               .to('.sheet-front', { x: 7, duration: 0.05, yoyo: true, repeat: 5 }, '<0.3')
           )
 
-          // Community chips reshuffle with FLIP while the card is on screen
           const chips = gsap.utils.toArray('.cchip')
           const shuffle = () => {
             const state = Flip.getState(chips)
@@ -447,7 +425,6 @@ export default function Landing() {
           whileVisible('.v-chips', chipLoop)
           cleanups.push(() => chips.forEach((c) => { c.style.order = '' }))
 
-          // Citation types itself out in APA, then BibTeX
           const out = q('.cite-out')
           const tabs = gsap.utils.toArray('.ct')
           const setTab = (i) => tabs.forEach((t, j) => t.classList.toggle('active', i === j))
@@ -464,13 +441,11 @@ export default function Landing() {
           whileVisible('.v-cite', citeLoop)
           cleanups.push(() => { out.textContent = APA_TEXT; setTab(0) })
 
-          // Notifications drop in one after another, then clear
           const notifLoop = gsap.timeline({ repeat: -1, repeatDelay: 0.3, paused: true })
             .from('.nt', { y: -44, opacity: 0, scale: 0.94, duration: 0.7, stagger: 0.55, ease: 'expo.out' })
             .to('.nt', { y: 18, opacity: 0, duration: 0.45, stagger: 0.07, ease: 'power2.in' }, '+=2.4')
           whileVisible('.v-notifs', notifLoop)
 
-          /* How it works: horizontal pan on desktop, giant verbs rise as each panel arrives */
           const verbs = gsap.utils.toArray('.jp-verb')
           if (wide) {
             const journey = q('.journey')
@@ -500,7 +475,6 @@ export default function Landing() {
             })
           }
 
-          /* Statement fills in word by word with the scroll */
           const statement = split('.statement p', { type: 'words' })
           gsap.from(statement.words, {
             opacity: 0.12,
@@ -509,11 +483,9 @@ export default function Landing() {
             scrollTrigger: { trigger: '.statement', start: 'top 78%', end: 'bottom 60%', scrub: true },
           })
 
-          /* Footer wordmark rises letter by letter */
           const mark = split('.l-wordmark', { type: 'chars', mask: 'chars' })
           gsap.from(mark.chars, { yPercent: 100, stagger: 0.06, duration: 1.2, ease: 'expo.out', scrollTrigger: { trigger: '.l-wordmark', start: 'top 98%', once: true } })
 
-          /* Magnetic buttons */
           if (fine) {
             gsap.utils.toArray('.magnetic').forEach((btn) => {
               const x = gsap.quickTo(btn, 'x', { duration: 0.6, ease: 'elastic.out(1, 0.45)' })
@@ -535,7 +507,6 @@ export default function Landing() {
       )
     }, root)
 
-    // Webfont swap changes line heights; recalculate trigger positions once it lands
     document.fonts?.ready.then(() => ScrollTrigger.refresh())
     return () => ctx.revert()
   }, [])

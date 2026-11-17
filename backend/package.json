@@ -5,14 +5,26 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --watch --env-file-if-exists=.env server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "smoke": "node scripts/smoke.mjs",
+    "reset-password": "node --env-file-if-exists=.env scripts/reset-password.mjs",
+    "mail:test": "node --env-file-if-exists=.env scripts/check-mail.mjs",
+    "make-super-admin": "node --env-file-if-exists=.env scripts/make-super-admin.mjs"
   },
   "dependencies": {
+    "@hocuspocus/extension-database": "^4.8.0",
+    "@hocuspocus/server": "^4.8.0",
     "bcryptjs": "^3.0.3",
+    "crossws": "^0.4.17",
     "express": "^5.3.0",
     "express-rate-limit": "^8.7.2",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.4.0",
+    "nodemailer": "^10.3.1",
+    "pdfjs-dist": "6.4.299",
     "pg": "^8.23.1"
+  },
+  "engines": {
+    "node": ">=22.13"
   }
 }

@@ -1,8 +1,7 @@
-export const ROLE_LABEL = { admin: 'Admin', moderator: 'Moderator', author: 'Author', user: 'Member' }
+export const ROLE_LABEL = { admin: 'Author', moderator: 'Moderator', author: 'Author', user: 'Member' }
 
 export const initials = (name) => name.split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase()
 
-// Stable brand colour per name, so each person keeps the same avatar colour
 const COLORS = ['orange', 'teal', 'blue', 'yellow']
 export const colorFor = (name) => COLORS[[...name].reduce((h, c) => h + c.charCodeAt(0), 0) % COLORS.length]
 

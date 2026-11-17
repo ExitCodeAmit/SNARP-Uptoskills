@@ -1,22 +1,46 @@
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { randomBytes, randomUUID } from 'node:crypto'
 import express from 'express'
 import pg from 'pg'
 import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import { sniffImage } from './image.js'
-import { DEFAULT_MAX_PDF_BYTES, validatePaperSubmission } from './paper.js'
+import {
+  groupStories, mp4Duration, parseOverlay, sniffVideo, splitVideo,
+  STORY_ACTIVE_LIMIT, STORY_BACKGROUNDS, STORY_IMAGE_MAX_BYTES, STORY_KINDS, STORY_VIDEO_MAX_BYTES, STORY_VIDEO_MAX_SECONDS,
+} from './story.js'
+import { DEFAULT_MAX_PDF_BYTES, isPdf, validatePaperSubmission } from './paper.js'
+import { analysePdf } from './pdf-analysis.js'
 import { createSessionToken, REMEMBERED_SESSION_SECONDS, TEMPORARY_SESSION_SECONDS, verifySessionToken } from './session.js'
 import { runMigrations } from './migrate.js'
 import { validateProfileUpdate } from './profile.js'
 import { buildPaperDiscovery } from './paper-search.js'
+import { buildProfile, recommendPapers, relatedTopics, similarPapers, suggestTopics, topInterests } from './recommend.js'
 import { validateCommunity, validateCommunityPost } from './community.js'
 import { validateMessageBody, validateRecipientId } from './messaging.js'
 import { validateEvent } from './event.js'
 import { rateLimit } from 'express-rate-limit'
+import { describeDevice, emailProblem, nameProblem, normalizeEmail, passwordProblem } from './credentials.js'
+import { anonymise, average, CRITERIA, RECOMMENDATIONS, validateResubmission, validateReview } from './peer-review.js'
+import { blockProblem, can, moderationProblem, nextStatus, overrideProblem, PAPER_STATUSES, requirePermission, roleChangeProblem } from './rbac.js'
+import { deleteFile, fileDetails, imagekitConfig, isFileId, listReelFiles, parseReelOptions, parseReelSettings, REEL_FOLDER, reelCaptionProblem, reelFileProblem, uploadAuth } from './reel.js'
+import { assistantConfig, loadGuide, selectGuide, splitGuide, streamAnswer, systemPrompt, validateChat } from './assistant.js'
+import { attachCollaborationWebSocket, createCollaborationServer, flushCollaboration } from './collaboration.js'
+import { createDocumentsRouter } from './documents.js'
+import { createMailer, createVerificationToken, hashToken, isTokenShape, passwordResetEmail, RESET_TTL_MINUTES, VERIFICATION_TTL_HOURS, verificationEmail } from './mailer.js'
 
-// Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
+const FRONTEND_DIST = process.env.FRONTEND_DIST || fileURLToPath(new URL('../frontend/dist/', import.meta.url))
+const SERVE_FRONTEND = process.env.SERVE_FRONTEND !== 'false' && existsSync(join(FRONTEND_DIST, 'index.html'))
+
+const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+const DATABASE_URL = process.env.DATABASE_URL?.trim() || ''
 const DB_NAME = process.env.PGDATABASE || 'snarp'
+const dbConfig = DATABASE_URL ? { connectionString: DATABASE_URL } : { database: DB_NAME }
+const DB_AUTO_CREATE = process.env.DB_AUTO_CREATE
+  ? process.env.DB_AUTO_CREATE === 'true'
+  : !IS_PRODUCTION && !DATABASE_URL
 const PORT = process.env.PORT || 5000
 const PG_POOL_MAX = Number.parseInt(process.env.PGPOOL_MAX || '10', 10)
 if (!Number.isSafeInteger(PG_POOL_MAX) || PG_POOL_MAX < 1 || PG_POOL_MAX > 100) {
@@ -25,14 +49,15 @@ if (!Number.isSafeInteger(PG_POOL_MAX) || PG_POOL_MAX < 1 || PG_POOL_MAX > 100) 
 const log = (level, event, fields = {}) => console.log(JSON.stringify({
   timestamp: new Date().toISOString(), level, event, ...fields,
 }))
+const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION !== 'false'
+const APP_URL = (process.env.APP_URL || '').trim().replace(/\/$/, '')
+const mailer = createMailer({ log })
 const configuredMaxPdfBytes = Number(process.env.PAPER_MAX_PDF_BYTES || '')
 const MAX_PDF_BYTES = Number.isSafeInteger(configuredMaxPdfBytes) && configuredMaxPdfBytes > 0
   ? Math.min(configuredMaxPdfBytes, DEFAULT_MAX_PDF_BYTES)
   : DEFAULT_MAX_PDF_BYTES
 
-// Local development can bootstrap a persistent secret. Production must receive
-// its secret from the deployment environment or a secret manager.
-if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
+if (!process.env.JWT_SECRET && IS_PRODUCTION) {
   throw new Error('JWT_SECRET must be configured in production')
 }
 if (!process.env.JWT_SECRET) {
@@ -44,7 +69,7 @@ if (Buffer.byteLength(process.env.JWT_SECRET, 'utf8') < 32) {
   throw new Error('JWT_SECRET must be at least 32 bytes')
 }
 const JWT_SECRET = process.env.JWT_SECRET
-// Unknown accounts still pay bcrypt's comparison cost to reduce timing-based enumeration.
+const BLOCKED_MESSAGE = 'This account has been suspended. Contact the platform administrator if you think this is a mistake.'
 const DUMMY_PASSWORD_HASH = await bcrypt.hash(randomBytes(32).toString('hex'), 10)
 const isPgId = (value) => /^\d+$/.test(value) && Number(value) > 0 && Number(value) <= 2147483647
 const isSafeId = (value) => /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0
@@ -53,8 +78,7 @@ const isPgBigId = (value) => {
   try { return BigInt(value) > 0n && BigInt(value) <= 9223372036854775807n } catch { return false }
 }
 
-// Creates the database on first run, then applies ordered SQL migrations.
-async function setupDb() {
+async function createDatabaseIfMissing() {
   const admin = new pg.Client({ database: 'postgres' })
   let adminConnected = false
   try {
@@ -66,15 +90,18 @@ async function setupDb() {
         await admin.query(`CREATE DATABASE "${DB_NAME.replaceAll('"', '""')}"`)
         log('info', 'database_created', { database: DB_NAME })
       } catch (err) {
-        // Another server process may have created the database after our check.
         if (err.code !== '42P04') throw err
       }
     }
   } finally {
     if (adminConnected) await admin.end()
   }
+}
 
-  const pool = new pg.Pool({ database: DB_NAME, max: PG_POOL_MAX })
+async function setupDb() {
+  if (DB_AUTO_CREATE) await createDatabaseIfMissing()
+  const pool = new pg.Pool({ ...dbConfig, max: PG_POOL_MAX })
+  pool.on('error', (err) => log('error', 'database_pool_error', { code: err.code ?? 'unknown' }))
   try {
     await runMigrations(pool, new URL('./migrations/', import.meta.url))
   } catch (err) {
@@ -86,7 +113,7 @@ async function setupDb() {
 
 const pool = await setupDb().catch((err) => {
   log('error', 'database_setup_failed', { code: err.code ?? 'unknown', message: err.message })
-  console.error('Check PGHOST/PGPORT/PGUSER/PGPASSWORD in backend/.env')
+  console.error('Check DATABASE_URL or PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE')
   process.exit(1)
 })
 
@@ -102,19 +129,38 @@ if (trustProxyConfig) {
     : trustProxyConfig.split(',').map((proxy) => proxy.trim()).filter(Boolean))
 }
 app.disable('x-powered-by')
-app.use((_req, res, next) => {
+const IMAGEKIT = imagekitConfig()
+const REEL_ORIGIN = IMAGEKIT ? ` ${IMAGEKIT.origin}` : ''
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  `img-src 'self' data: blob:${REEL_ORIGIN}`,
+  "font-src 'self' data:",
+  `connect-src 'self'${IMAGEKIT ? ' https://upload.imagekit.io' : ''}`,
+  `media-src 'self' blob:${REEL_ORIGIN}`,
+  "frame-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join('; ')
+app.use((req, res, next) => {
   res.set({
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'SAMEORIGIN',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
     'Permissions-Policy': 'camera=(), geolocation=(), microphone=()',
+    'Content-Security-Policy': CONTENT_SECURITY_POLICY,
+    'Cross-Origin-Opener-Policy': 'same-origin',
   })
+  if (IS_PRODUCTION && req.secure) res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
   next()
 })
 app.use(express.json({ limit: '100kb' }))
 
 const signupLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
+  windowMs: 60 * 60 * 1000,
   limit: 5,
   standardHeaders: true,
   legacyHeaders: false,
@@ -125,8 +171,20 @@ const signupLimiter = rateLimit({
   },
 })
 
+const accountLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `login:${normalizeEmail(req.body?.email)}`,
+  handler: (_req, res) => res.status(429).json({
+    error: 'Too many failed attempts for this account. Wait 15 minutes, then try again.',
+  }),
+})
+
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   limit: 10,
   skipSuccessfulRequests: true,
   standardHeaders: true,
@@ -136,6 +194,52 @@ const loginLimiter = rateLimit({
       error: 'Too many failed login attempts. Please try again later.',
     })
   },
+})
+
+const resendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `resend:${normalizeEmail(req.body?.email)}`,
+  handler: (_req, res) => res.status(429).json({ error: 'Too many emails requested. Wait 15 minutes, then try again.' }),
+})
+
+const verifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: 'Too many attempts. Please try again later.' }),
+})
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number.parseInt(process.env.API_RATE_LIMIT, 10) || 1500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health',
+  handler: (_req, res) => res.status(429).json({ error: 'Too many requests. Please slow down and try again shortly.' }),
+})
+app.use('/api', apiLimiter)
+
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number.parseInt(process.env.WRITE_RATE_LIMIT, 10) || 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `user:${req.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: 'You are doing that too often. Please wait a minute and try again.' }),
+})
+
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `user:${req.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: 'Too many password attempts. Please try again later.' }),
 })
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } })
@@ -158,15 +262,17 @@ const publicUser = ({
   skills,
   links,
 })
-async function issue(user, remember = true) {
+async function issue(user, remember = true, req = null) {
+  if (user.blocked_at) throw Object.assign(new Error(BLOCKED_MESSAGE), { status: 403 })
   const sessionId = randomUUID()
   const expiresIn = remember ? REMEMBERED_SESSION_SECONDS : TEMPORARY_SESSION_SECONDS
   const expiresAt = new Date(Date.now() + expiresIn * 1000)
   await pool.query('DELETE FROM auth_sessions WHERE expires_at <= now() OR revoked_at < now() - interval \'30 days\'')
   await pool.query(
-    'INSERT INTO auth_sessions (id, user_id, expires_at) VALUES ($1, $2, $3)',
-    [sessionId, user.id, expiresAt]
+    'INSERT INTO auth_sessions (id, user_id, expires_at, user_agent, remember) VALUES ($1, $2, $3, $4, $5)',
+    [sessionId, user.id, expiresAt, String(req?.get('user-agent') ?? '').slice(0, 400), remember]
   )
+  await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id])
   const { token } = createSessionToken(user.id, sessionId, JWT_SECRET, remember)
   return { token, user: publicUser(user) }
 }
@@ -182,11 +288,21 @@ async function auth(req, res, next) {
 
   try {
     const { rows } = await pool.query(
-      `SELECT u.role FROM auth_sessions s JOIN users u ON u.id = s.user_id
-       WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now()`,
+      `SELECT u.role, u.blocked_at, s.revoked_at IS NULL AND s.expires_at > now() AS valid,
+         s.last_seen_at < now() - interval '5 minutes' AS stale
+       FROM auth_sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.id = $1 AND s.user_id = $2`,
       [payload.jti, payload.sub]
     )
-    if (!rows[0]) return res.status(401).json({ error: 'Please log in again' })
+    if (rows[0]?.blocked_at) {
+      if (rows[0].valid) await pool.query('UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [payload.sub])
+      return res.status(403).json({ error: BLOCKED_MESSAGE, code: 'account_blocked' })
+    }
+    if (!rows[0]?.valid) return res.status(401).json({ error: 'Please log in again' })
+    if (rows[0].stale) {
+      pool.query('UPDATE auth_sessions SET last_seen_at = now() WHERE id = $1', [payload.jti])
+        .catch((err) => log('error', 'session_touch_failed', { message: err.message }))
+    }
     req.userId = payload.sub
     req.sessionId = payload.jti
     req.userRole = rows[0].role
@@ -196,22 +312,12 @@ async function auth(req, res, next) {
   }
 }
 
-function requireAuthor(req, res, next) {
-  if (req.userRole !== 'author') return res.status(403).json({ error: 'Author access required' })
-  next()
-}
-
-function requireModerator(req, res, next) {
-  if (!['admin', 'moderator'].includes(req.userRole)) {
-    return res.status(403).json({ error: 'Moderator or Admin access required' })
-  }
-  next()
-}
-
-function requireAdmin(req, res, next) {
-  if (req.userRole !== 'admin') return res.status(403).json({ error: 'Admin access required' })
-  next()
-}
+const requireAuthor = requirePermission('papers.submit', 'Author access required')
+const isModerator = (req) => can(req.userRole, 'papers.moderate')
+const isSuperAdmin = (req) => can(req.userRole, 'admin.access')
+const isReviewer = (req) => ['author', 'moderator', 'admin'].includes(req.userRole)
+const requireModerator = requirePermission('papers.moderate', 'Moderator or Super Admin access required')
+const requireAdmin = requirePermission('admin.access', 'Super Admin access required')
 
 function requireEventOrganizer(req, res, next) {
   if (!['author', 'moderator', 'admin'].includes(req.userRole)) {
@@ -221,38 +327,196 @@ function requireEventOrganizer(req, res, next) {
 }
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
-  const name = String(req.body?.name ?? '').trim()
-  const email = String(req.body?.email ?? '').trim().toLowerCase()
+  const name = String(req.body?.name ?? '').trim().replace(/\s+/g, ' ')
+  const email = normalizeEmail(req.body?.email)
   const password = String(req.body?.password ?? '')
-  // Admin/Moderator are assigned by an admin, never self-selected
   const role = req.body?.role === 'author' ? 'author' : 'user'
-  if (!name || name.length > 100) return res.status(400).json({ error: 'Enter your full name' })
-  if (!/^\S+@\S+\.\S+$/.test(email) || email.length > 255) return res.status(400).json({ error: 'Enter a valid email address' })
-  if (password.length < 8 || password.length > 72) return res.status(400).json({ error: 'Password must be 8-72 characters' })
+  const problem = [['name', nameProblem(name)], ['email', emailProblem(email)], ['password', passwordProblem(password, { email, name })]]
+    .find(([, message]) => message)
+  if (problem) return res.status(400).json({ error: problem[1], field: problem[0] })
 
   const hash = await bcrypt.hash(password, 10)
   try {
     const { rows } = await pool.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, email, hash, role]
+      `INSERT INTO users (name, email, password_hash, role, email_verified_at)
+       VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN NULL ELSE now() END) RETURNING *`,
+      [name, email, hash, role, REQUIRE_EMAIL_VERIFICATION]
     )
-    res.status(201).json(await issue(rows[0]))
+    if (!REQUIRE_EMAIL_VERIFICATION) return res.status(201).json(await issue(rows[0], true, req))
+    const emailSent = await sendVerification(rows[0], req)
+    res.status(201).json({ verification_required: true, email, email_sent: emailSent })
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists' })
+    if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Log in instead?', field: 'email' })
     throw err
   }
 })
 
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
-  const email = String(req.body?.email ?? '').trim().toLowerCase()
+app.post('/api/auth/login', loginLimiter, accountLoginLimiter, async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
   const password = String(req.body?.password ?? '')
   const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email])
   const passwordMatches = await bcrypt.compare(password, rows[0]?.password_hash ?? DUMMY_PASSWORD_HASH)
   if (!rows[0] || !passwordMatches) {
     return res.status(401).json({ error: 'Incorrect email or password' })
   }
+  if (!rows[0].email_verified_at) {
+    return res.status(403).json({
+      error: 'Confirm your email address first. We sent a link to your inbox when you signed up.',
+      code: 'email_unverified',
+    })
+  }
+  if (rows[0].blocked_at) return res.status(403).json({ error: BLOCKED_MESSAGE, code: 'account_blocked' })
   const remember = req.body?.remember !== false
-  res.json(await issue(rows[0], remember))
+  res.json(await issue(rows[0], remember, req))
+})
+
+app.post('/api/admin/login', loginLimiter, accountLoginLimiter, async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  const password = String(req.body?.password ?? '')
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email])
+  const passwordMatches = await bcrypt.compare(password, rows[0]?.password_hash ?? DUMMY_PASSWORD_HASH)
+  const user = rows[0]
+  if (!user || !passwordMatches || !can(user.role, 'admin.access') || !user.email_verified_at) {
+    return res.status(401).json({ error: 'These details do not open the admin desk' })
+  }
+  if (user.blocked_at) return res.status(403).json({ error: BLOCKED_MESSAGE, code: 'account_blocked' })
+  const session = await issue(user, false, req)
+  await audit(pool, user.id, 'admin.login', 'user', user.id, {})
+  res.json(session)
+})
+
+async function sendVerification(user, req) {
+  const { token, hash } = createVerificationToken()
+  await pool.query('DELETE FROM email_verifications WHERE user_id = $1 AND used_at IS NULL', [user.id])
+  await pool.query(
+    `INSERT INTO email_verifications (token_hash, user_id, expires_at)
+     VALUES ($1, $2, now() + make_interval(hours => $3))`,
+    [hash, user.id, VERIFICATION_TTL_HOURS]
+  )
+  const base = APP_URL || (IS_PRODUCTION ? `http://localhost:${PORT}` : `${req.protocol}://${req.get('host')}`)
+  const link = `${base}/verify-email?token=${token}`
+  try {
+    const { delivered } = await mailer.send({ to: user.email, ...verificationEmail({ name: user.name, link }) })
+    return delivered
+  } catch (err) {
+    log('error', 'verification_email_failed', { userId: user.id, message: err.message })
+    return false
+  }
+}
+
+app.post('/api/auth/verify-email', verifyLimiter, async (req, res) => {
+  const token = req.body?.token
+  if (!isTokenShape(token)) return res.status(400).json({ error: 'This verification link is not valid.', code: 'invalid' })
+  const hash = hashToken(token)
+  const { rows } = await pool.query(
+    `UPDATE email_verifications SET used_at = now()
+     WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING user_id`,
+    [hash]
+  )
+  if (!rows[0]) {
+    const { rows: known } = await pool.query(
+      `SELECT v.used_at, v.expires_at <= now() AS expired, u.email_verified_at, u.email
+       FROM email_verifications v JOIN users u ON u.id = v.user_id WHERE v.token_hash = $1`,
+      [hash]
+    )
+    if (known[0]?.used_at || known[0]?.email_verified_at) {
+      return res.status(410).json({ error: 'This link has already been used. Your email is confirmed, so you can log in.', code: 'already_verified' })
+    }
+    if (known[0]?.expired) {
+      return res.status(410).json({ error: 'This verification link has expired. Request a new one below.', code: 'expired', email: known[0].email })
+    }
+    return res.status(400).json({ error: 'This verification link is not valid. Request a new one below.', code: 'invalid' })
+  }
+  const { rows: users } = await pool.query(
+    'UPDATE users SET email_verified_at = COALESCE(email_verified_at, now()) WHERE id = $1 RETURNING *',
+    [rows[0].user_id]
+  )
+  await pool.query('DELETE FROM email_verifications WHERE user_id = $1 AND used_at IS NULL', [rows[0].user_id])
+  res.json(await issue(users[0], true, req))
+})
+
+app.post('/api/auth/forgot-password', verifyLimiter, resendLimiter, async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  if (emailProblem(email)) return res.status(400).json({ error: 'Enter a valid email address', field: 'email' })
+  const { rows } = await pool.query(
+    `SELECT u.* FROM users u WHERE u.email = $1
+     AND NOT EXISTS (SELECT 1 FROM password_resets r WHERE r.user_id = u.id AND r.created_at > now() - interval '60 seconds')`,
+    [email]
+  )
+  const user = rows[0]
+  if (user) {
+    const { token, hash } = createVerificationToken()
+    await pool.query('DELETE FROM password_resets WHERE user_id = $1 AND used_at IS NULL', [user.id])
+    await pool.query(
+      'INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES ($1, $2, now() + make_interval(mins => $3))',
+      [hash, user.id, RESET_TTL_MINUTES]
+    )
+    const base = APP_URL || (IS_PRODUCTION ? `http://localhost:${PORT}` : `${req.protocol}://${req.get('host')}`)
+    try {
+      await mailer.send({ to: user.email, ...passwordResetEmail({ name: user.name, link: `${base}/reset-password?token=${token}` }) })
+    } catch (err) {
+      log('error', 'password_reset_email_failed', { userId: user.id, message: err.message })
+    }
+  }
+  res.json({ message: 'If an account uses that email, a link to reset the password is on its way. It works for 60 minutes.' })
+})
+
+app.post('/api/auth/reset-password', verifyLimiter, async (req, res) => {
+  const token = req.body?.token
+  const password = String(req.body?.password ?? '')
+  if (!isTokenShape(token)) return res.status(400).json({ error: 'This reset link is not valid. Request a new one.', code: 'invalid' })
+  const client = await pool.connect()
+  let open = false
+  try {
+    await client.query('BEGIN')
+    open = true
+    const stop = async (status, body) => { await client.query('ROLLBACK'); open = false; return res.status(status).json(body) }
+    const { rows } = await client.query(
+      `SELECT r.user_id, r.used_at, r.expires_at <= now() AS expired, u.email, u.name
+       FROM password_resets r JOIN users u ON u.id = r.user_id WHERE r.token_hash = $1 FOR UPDATE OF r`,
+      [hashToken(token)]
+    )
+    const reset = rows[0]
+    if (!reset) return await stop(400, { error: 'This reset link is not valid. Request a new one.', code: 'invalid' })
+    if (reset.used_at) return await stop(410, { error: 'This reset link has already been used. Request a new one if you still need it.', code: 'used' })
+    if (reset.expired) return await stop(410, { error: 'This reset link has expired. Request a new one.', code: 'expired' })
+    const weakness = passwordProblem(password, reset)
+    if (weakness) return await stop(400, { error: weakness, field: 'password' })
+    await client.query(
+      'UPDATE users SET password_hash = $2, email_verified_at = COALESCE(email_verified_at, now()) WHERE id = $1',
+      [reset.user_id, await bcrypt.hash(password, 10)]
+    )
+    await client.query('UPDATE password_resets SET used_at = now() WHERE token_hash = $1', [hashToken(token)])
+    await client.query('DELETE FROM password_resets WHERE user_id = $1 AND used_at IS NULL', [reset.user_id])
+    await client.query('UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [reset.user_id])
+    await client.query(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       VALUES ($1::int, 'account.password_reset', 'user', $1::text, '{"source": "email"}'::jsonb)`,
+      [reset.user_id]
+    )
+    await client.query('COMMIT')
+    open = false
+    res.json({ message: 'Password changed. Log in with your new password.', email: reset.email })
+  } catch (err) {
+    if (open) await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+app.post('/api/auth/resend-verification', verifyLimiter, resendLimiter, async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  if (emailProblem(email)) return res.status(400).json({ error: 'Enter a valid email address', field: 'email' })
+  if (REQUIRE_EMAIL_VERIFICATION) {
+    const { rows } = await pool.query(
+      `SELECT u.* FROM users u WHERE u.email = $1 AND u.email_verified_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM email_verifications v WHERE v.user_id = u.id AND v.created_at > now() - interval '60 seconds')`,
+      [email]
+    )
+    if (rows[0]) await sendVerification(rows[0], req)
+  }
+  res.json({ message: 'If that address has an account waiting for confirmation, a new link is on its way.' })
 })
 
 app.post('/api/auth/logout', auth, async (req, res) => {
@@ -265,12 +529,16 @@ app.get('/api/auth/me', auth, async (req, res) => {
     `SELECT u.*, COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department,
       COALESCE(up.research_interests, '{}') AS research_interests, COALESCE(up.bio, '') AS bio,
       COALESCE(up.skills, '{}') AS skills, COALESCE(up.links, '[]'::jsonb) AS links,
-      (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count
+      (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count,
+      (SELECT count(*)::int FROM papers p WHERE (p.user_id = u.id OR p.authors @> jsonb_build_array(jsonb_build_object('user_id', u.id))) AND p.status = 'published') AS paper_count,
+      (SELECT count(*)::int FROM follows WHERE followee_id = u.id) AS follower_count,
+      (SELECT count(*)::int FROM follows WHERE follower_id = u.id) AS following_count
      FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id WHERE u.id = $1`,
     [req.userId]
   )
   if (!rows[0]) return res.status(401).json({ error: 'Please log in again' })
-  res.json({ ...publicUser(rows[0]), post_count: rows[0].post_count })
+  const { post_count, paper_count, follower_count, following_count } = rows[0]
+  res.json({ ...publicUser(rows[0]), post_count, paper_count, follower_count, following_count })
 })
 
 app.put('/api/auth/me', auth, async (req, res) => {
@@ -315,6 +583,121 @@ app.put('/api/auth/me', auth, async (req, res) => {
   res.json({ ...publicUser(rows[0]), post_count: rows[0].post_count })
 })
 
+app.put('/api/auth/me/role', auth, writeLimiter, async (req, res) => {
+  const role = req.body?.role
+  if (!['user', 'author'].includes(role)) return res.status(400).json({ error: 'Account type must be member or author', field: 'role' })
+  const { rows } = await pool.query(
+    `WITH old AS (SELECT role FROM users WHERE id = $1),
+      changed AS (
+        UPDATE users SET role = $2 WHERE id = $1 AND role IN ('user', 'author') AND role <> $2 RETURNING role
+      ), logged AS (
+        INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+        SELECT $1, 'account.role_change', 'user', $1::text, jsonb_build_object('from', (SELECT role FROM old), 'to', $2::text)
+        FROM changed RETURNING id
+      )
+     SELECT (SELECT role FROM old) AS before, (SELECT role FROM changed) AS after`,
+    [req.userId, role]
+  )
+  const { before, after } = rows[0]
+  if (!['user', 'author'].includes(before)) {
+    return res.status(403).json({ error: 'Moderator and admin roles are managed by an administrator' })
+  }
+  res.json({ role: after ?? before })
+})
+
+app.put('/api/auth/me/password', auth, passwordLimiter, async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword ?? '')
+  const newPassword = String(req.body?.newPassword ?? '')
+  const { rows } = await pool.query('SELECT password_hash, email, name FROM users WHERE id = $1', [req.userId])
+  const weakness = passwordProblem(newPassword, rows[0])
+  if (weakness) return res.status(400).json({ error: weakness, field: 'newPassword' })
+  if (!rows[0] || !await bcrypt.compare(currentPassword, rows[0].password_hash)) {
+    return res.status(400).json({ error: 'Current password is incorrect', field: 'currentPassword' })
+  }
+  if (await bcrypt.compare(newPassword, rows[0].password_hash)) {
+    return res.status(400).json({ error: 'Choose a password you have not used here before', field: 'newPassword' })
+  }
+  const hash = await bcrypt.hash(newPassword, 10)
+  await pool.query(
+    `WITH updated AS (UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING id)
+     UPDATE auth_sessions SET revoked_at = now()
+     WHERE user_id IN (SELECT id FROM updated) AND id <> $3 AND revoked_at IS NULL`,
+    [req.userId, hash, req.sessionId]
+  )
+  res.status(204).end()
+})
+
+app.get('/api/auth/sessions', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, created_at, last_seen_at, expires_at, user_agent, remember FROM auth_sessions
+     WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
+     ORDER BY (id = $2) DESC, last_seen_at DESC LIMIT 50`,
+    [req.userId, req.sessionId]
+  )
+  res.json(rows.map(({ user_agent, ...session }) => ({
+    ...session,
+    device: describeDevice(user_agent),
+    current: session.id === req.sessionId,
+  })))
+})
+
+app.delete('/api/auth/sessions', auth, async (req, res) => {
+  const { rowCount } = await pool.query(
+    'UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL',
+    [req.userId, req.sessionId]
+  )
+  res.json({ revoked: rowCount })
+})
+
+app.delete('/api/auth/sessions/:id', auth, async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).json({ error: 'Session not found' })
+  const { rowCount } = await pool.query(
+    'UPDATE auth_sessions SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL',
+    [req.params.id, req.userId]
+  )
+  if (!rowCount) return res.status(404).json({ error: 'Session not found' })
+  res.status(204).end()
+})
+
+app.delete('/api/auth/me', auth, passwordLimiter, async (req, res) => {
+  const password = String(req.body?.password ?? '')
+  const { rows } = await pool.query('SELECT password_hash, role FROM users WHERE id = $1', [req.userId])
+  if (!rows[0] || !await bcrypt.compare(password, rows[0].password_hash)) {
+    return res.status(400).json({ error: 'Password is incorrect', field: 'password' })
+  }
+  const client = await pool.connect()
+  let transactionStarted = false
+  try {
+    await client.query('BEGIN')
+    transactionStarted = true
+    if (rows[0].role === 'admin') {
+      await client.query('LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')
+      const admins = await client.query("SELECT count(*)::int AS n FROM users WHERE role = 'admin' AND id <> $1", [req.userId])
+      if (!admins.rows[0].n) {
+        await client.query('ROLLBACK')
+        transactionStarted = false
+        return res.status(409).json({ error: 'Promote another admin before deleting the only admin account' })
+      }
+    }
+    await client.query('DELETE FROM events WHERE created_by = $1', [req.userId])
+    await client.query('DELETE FROM communities WHERE created_by = $1', [req.userId])
+    await client.query(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       VALUES (NULL, 'account.delete', 'user', $1::text, jsonb_build_object('role', $2::text))`,
+      [req.userId, rows[0].role]
+    )
+    await client.query('DELETE FROM users WHERE id = $1', [req.userId])
+    await client.query('COMMIT')
+    transactionStarted = false
+  } catch (err) {
+    if (transactionStarted) await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+  res.status(204).end()
+})
+
 app.get('/api/communities', auth, async (req, res) => {
   const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
   const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20))
@@ -333,7 +716,7 @@ app.get('/api/communities', auth, async (req, res) => {
   res.json({ items: rows, page, limit, hasMore: rows.length === limit })
 })
 
-app.post('/api/communities', auth, async (req, res) => {
+app.post('/api/communities', auth, writeLimiter, async (req, res) => {
   let community
   try { community = validateCommunity(req.body) } catch (err) {
     return res.status(400).json({ error: err.message, field: err.field })
@@ -444,6 +827,25 @@ app.put('/api/communities/:id/membership', auth, async (req, res) => {
   return res.json({ joined: false })
 })
 
+app.delete('/api/communities/:id', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Community not found' })
+  const { rows } = await pool.query(`
+    WITH target AS (
+      SELECT c.id, c.name, (SELECT count(*)::int FROM community_members cm WHERE cm.community_id = c.id) AS member_count
+      FROM communities c
+      WHERE c.id = $1 AND EXISTS (SELECT 1 FROM community_members cm WHERE cm.community_id = c.id AND cm.user_id = $2 AND cm.role = 'owner')
+    ), logged AS (
+      INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+      SELECT $2, 'community.disband', 'community', id::text, jsonb_build_object('name', name, 'memberCount', member_count) FROM target
+    ), removed AS (
+      DELETE FROM communities c USING target WHERE c.id = target.id RETURNING c.id
+    ) SELECT id FROM removed`, [req.params.id, req.userId])
+  if (rows[0]) return res.status(204).end()
+  const exists = await pool.query('SELECT 1 FROM communities WHERE id = $1', [req.params.id])
+  if (!exists.rowCount) return res.status(404).json({ error: 'Community not found' })
+  res.status(403).json({ error: 'Only the community owner can disband it' })
+})
+
 app.get('/api/communities/:id/posts', auth, async (req, res) => {
   if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Community not found' })
   const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
@@ -462,7 +864,7 @@ app.get('/api/communities/:id/posts', auth, async (req, res) => {
   res.json({ items: rows.map(({ profile_image_id, ...post }) => ({ ...post, author_avatar_url: profile_image_id ? `/api/images/${profile_image_id}` : null })), page, limit, total: countResult.rows[0].total, hasMore: page * limit < countResult.rows[0].total })
 })
 
-app.post('/api/communities/:id/posts', auth, async (req, res) => {
+app.post('/api/communities/:id/posts', auth, writeLimiter, async (req, res) => {
   if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Community not found' })
   let body
   try { body = validateCommunityPost(req.body) } catch (err) {
@@ -491,7 +893,7 @@ app.get('/api/users/search', auth, async (req, res) => {
   if (!q) return res.json([])
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(
-    `SELECT u.id, u.name, u.role, u.profile_image_id,
+    `SELECT u.id, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role, u.profile_image_id,
       COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department
      FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id
      WHERE u.name ILIKE $1 OR up.institution ILIKE $1 OR up.department ILIKE $1
@@ -505,23 +907,97 @@ app.get('/api/users/search', auth, async (req, res) => {
   })))
 })
 
+app.get('/api/users/friends', auth, async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 80) : ''
+  const { rows } = await pool.query(
+    `SELECT u.id, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
+       COALESCE(up.institution, '') AS institution
+     FROM follows mine JOIN follows theirs ON theirs.follower_id = mine.followee_id AND theirs.followee_id = mine.follower_id
+     JOIN users u ON u.id = mine.followee_id LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE mine.follower_id = $1 AND ($2 = '' OR u.name ILIKE $3)
+     ORDER BY lower(u.name) LIMIT 200`,
+    [req.userId, q, `%${q.replace(/[\\%_]/g, '\\$&')}%`]
+  )
+  res.json(rows)
+})
+
+app.get('/api/users/suggestions', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `WITH me AS (SELECT COALESCE(research_interests, '{}') AS interests FROM user_profiles WHERE user_id = $1)
+     SELECT u.id, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
+       COALESCE(up.institution, '') AS institution,
+       (SELECT count(*)::int FROM unnest(COALESCE(up.research_interests, '{}')) AS theirs(value)
+         WHERE lower(theirs.value) IN (SELECT lower(mine.value) FROM me, unnest(me.interests) AS mine(value))) AS shared_interests,
+       (SELECT count(*)::int FROM follows f WHERE f.followee_id = u.id) AS follower_count
+     FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE u.id <> $1 AND NOT EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = u.id)
+     ORDER BY shared_interests DESC, follower_count DESC, u.created_at DESC
+     LIMIT 5`,
+    [req.userId]
+  )
+  res.json(rows)
+})
+
+app.put('/api/users/:id/follow', auth, writeLimiter, async (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
+  if (typeof req.body?.following !== 'boolean') return res.status(400).json({ error: 'following must be true or false' })
+  if (String(req.params.id) === String(req.userId)) return res.status(400).json({ error: 'You cannot follow yourself' })
+  const target = await pool.query('SELECT 1 FROM users WHERE id = $1', [req.params.id])
+  if (!target.rows[0]) return res.status(404).json({ error: 'User not found' })
+  if (req.body.following) {
+    await pool.query(`WITH inserted AS (
+        INSERT INTO follows (follower_id, followee_id) VALUES ($2, $1) ON CONFLICT DO NOTHING RETURNING follower_id, followee_id
+      ), notified AS (
+        INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+        SELECT inserted.followee_id, inserted.follower_id, 'follow', 'user', inserted.follower_id, actor.name || ' started following you'
+        FROM inserted JOIN users actor ON actor.id = inserted.follower_id RETURNING id
+      ) SELECT 1 FROM inserted`, [req.params.id, req.userId])
+  } else {
+    await pool.query('DELETE FROM follows WHERE follower_id = $2 AND followee_id = $1', [req.params.id, req.userId])
+  }
+  const { rows } = await pool.query(
+    `SELECT (SELECT count(*)::int FROM follows WHERE followee_id = $1) AS follower_count,
+       EXISTS (SELECT 1 FROM follows WHERE follower_id = $2 AND followee_id = $1) AS followed_by_me`,
+    [req.params.id, req.userId]
+  )
+  res.json(rows[0])
+})
+
+for (const [path, joinColumn, matchColumn] of [['followers', 'follower_id', 'followee_id'], ['following', 'followee_id', 'follower_id']]) {
+  app.get(`/api/users/:id/${path}`, auth, async (req, res) => {
+    if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url, COALESCE(up.institution, '') AS institution,
+         EXISTS (SELECT 1 FROM follows mine WHERE mine.follower_id = $2 AND mine.followee_id = u.id) AS followed_by_me
+       FROM follows f JOIN users u ON u.id = f.${joinColumn} LEFT JOIN user_profiles up ON up.user_id = u.id
+       WHERE f.${matchColumn} = $1 ORDER BY f.created_at DESC LIMIT 100`,
+      [req.params.id, req.userId]
+    )
+    res.json(rows)
+  })
+}
+
 app.get('/api/users/:id', auth, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
   const { rows } = await pool.query(
-    `SELECT u.id, u.name, u.role, u.created_at, u.profile_image_id,
+    `SELECT u.id, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role, u.created_at, u.profile_image_id,
       COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department,
       COALESCE(up.research_interests, '{}') AS research_interests, COALESCE(up.bio, '') AS bio,
       COALESCE(up.skills, '{}') AS skills, COALESCE(up.links, '[]'::jsonb) AS links,
-      (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count
+      (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count,
+      (SELECT count(*)::int FROM papers p WHERE (p.user_id = u.id OR p.authors @> jsonb_build_array(jsonb_build_object('user_id', u.id))) AND p.status = 'published') AS paper_count,
+      (SELECT count(*)::int FROM follows WHERE followee_id = u.id) AS follower_count,
+      (SELECT count(*)::int FROM follows WHERE follower_id = u.id) AS following_count,
+      EXISTS (SELECT 1 FROM follows WHERE follower_id = $2 AND followee_id = u.id) AS followed_by_me
      FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id WHERE u.id = $1`,
-    [req.params.id]
+    [req.params.id, req.userId]
   )
   if (!rows[0]) return res.status(404).json({ error: 'User not found' })
   const user = rows[0]
   const pinnedPostId = isPgId(req.query.post) ? req.query.post : null
   const posts = await pool.query(
-    `SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at,
-      (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+    `SELECT p.id, p.user_id, p.body, p.image_id, p.created_at, p.updated_at,
+      (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count, (SELECT count(*)::int FROM post_views pv WHERE pv.post_id = p.id) AS view_count,
       EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
       (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count
      FROM posts p WHERE p.user_id = $1 AND (
@@ -533,15 +1009,25 @@ app.get('/api/users/:id', auth, async (req, res) => {
      ORDER BY CASE WHEN p.id = $3 THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC LIMIT 20`,
     [user.id, req.userId, pinnedPostId]
   )
+  const papers = await pool.query(
+    `SELECT p.id, p.title, p.domain, p.tags, COALESCE(p.published_at, p.created_at) AS published_at,
+       (SELECT count(*)::int FROM paper_likes pl WHERE pl.paper_id = p.id) AS like_count, (SELECT count(*)::int FROM paper_views pw WHERE pw.paper_id = p.id) AS view_count,
+       (SELECT count(*)::int FROM paper_comments pc WHERE pc.paper_id = p.id) AS comment_count
+       , p.user_id <> $1 AS coauthored
+     FROM papers p WHERE (p.user_id = $1 OR p.authors @> jsonb_build_array(jsonb_build_object('user_id', $1::int))) AND p.status = 'published'
+     ORDER BY COALESCE(p.published_at, p.created_at) DESC, p.id DESC LIMIT 20`,
+    [user.id]
+  )
   const { profile_image_id, ...publicProfile } = user
   res.json({
     ...publicProfile,
     avatar_url: profile_image_id ? `/api/images/${profile_image_id}` : null,
     posts: posts.rows,
+    papers: papers.rows,
   })
 })
 
-app.put('/api/auth/me/photo', auth, upload.single('photo'), async (req, res) => {
+app.put('/api/auth/me/photo', auth, writeLimiter, upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose a photo to upload' })
   const mime = sniffImage(req.file.buffer)
   if (!mime) return res.status(400).json({ error: 'Photo must be a JPEG, PNG, GIF or WebP image' })
@@ -588,14 +1074,13 @@ app.put('/api/auth/me/photo', auth, upload.single('photo'), async (req, res) => 
 })
 
 const POST_SELECT = `
-  SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id, u.name AS author_name, u.role AS author_role,
+  SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id, u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
     CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
-    (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+    (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count, (SELECT count(*)::int FROM post_views pv WHERE pv.post_id = p.id) AS view_count,
     EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
     (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count
   FROM posts p JOIN users u ON u.id = p.user_id`
 
-// Mixed feed: social posts plus approved papers, newest first. Paper metadata is always read from PostgreSQL.
 app.get('/api/events', auth, async (req, res) => {
   const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
   const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20))
@@ -617,7 +1102,7 @@ app.get('/api/events', auth, async (req, res) => {
   res.json({ items: rows, page, limit, total: countResult.rows[0].total, hasMore: page * limit < countResult.rows[0].total })
 })
 
-app.post('/api/events', auth, requireEventOrganizer, async (req, res) => {
+app.post('/api/events', auth, requireEventOrganizer, writeLimiter, async (req, res) => {
   let event
   try { event = validateEvent(req.body) } catch (err) {
     return res.status(400).json({ error: err.message, field: err.field })
@@ -740,7 +1225,7 @@ app.get('/api/messages/conversations', auth, async (req, res) => {
   res.json(rows)
 })
 
-app.post('/api/messages/conversations', auth, async (req, res) => {
+app.post('/api/messages/conversations', auth, writeLimiter, async (req, res) => {
   let otherUserId
   try { otherUserId = validateRecipientId(req.body?.userId, req.userId) } catch (err) {
     return res.status(400).json({ error: err.message, field: err.field })
@@ -789,7 +1274,7 @@ app.get('/api/messages/conversations/:id/messages', auth, async (req, res) => {
   res.json({ items: rows, page, limit, total: countResult.rows[0].total, hasMore: page * limit < countResult.rows[0].total })
 })
 
-app.post('/api/messages/conversations/:id/messages', auth, async (req, res) => {
+app.post('/api/messages/conversations/:id/messages', auth, writeLimiter, async (req, res) => {
   if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Conversation not found' })
   let body
   try { body = validateMessageBody(req.body?.body) } catch (err) {
@@ -853,27 +1338,39 @@ app.get('/api/posts', auth, async (req, res) => {
   const page = Math.max(1, Math.min(50000, Number.parseInt(req.query.page, 10) || 1))
   const limit = 20
   const offset = (page - 1) * limit
+  const followingOnly = req.query.scope === 'following'
   const { rows } = await pool.query(`
+    WITH visible AS (
+      SELECT $3::integer AS user_id
+      UNION ALL SELECT followee_id FROM follows WHERE follower_id = $3 AND $4::boolean
+    )
     SELECT * FROM (
       SELECT 'post'::text AS type, p.id::text AS id, p.body, p.image_id::text AS image_id,
-        p.created_at, p.updated_at, p.user_id, u.name AS author_name, u.role AS author_role,
+        p.created_at, p.updated_at, p.user_id, u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
         CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
-        (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+        (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count, (SELECT count(*)::int FROM post_views pv WHERE pv.post_id = p.id) AS view_count,
         EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $3) AS liked_by_me,
         (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
+        false AS saved_by_me,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
-        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi,
+        NULL::text AS pdf_filename, NULL::int AS pdf_size
       FROM posts p JOIN users u ON u.id = p.user_id
+      WHERE NOT $4::boolean OR p.user_id IN (SELECT user_id FROM visible)
       UNION ALL
       SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
-        COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.updated_at, rp.user_id, u.name AS author_name, u.role AS author_role,
+        COALESCE(rp.published_at, rp.created_at) AS created_at, rp.updated_at, rp.user_id, u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
         CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
-        0::int AS like_count, false AS liked_by_me, 0::int AS comment_count,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
+        (SELECT count(*)::int FROM paper_likes pl WHERE pl.paper_id = rp.id) AS like_count, (SELECT count(*)::int FROM paper_views pw WHERE pw.paper_id = rp.id) AS view_count,
+        EXISTS (SELECT 1 FROM paper_likes pl WHERE pl.paper_id = rp.id AND pl.user_id = $3) AS liked_by_me,
+        (SELECT count(*)::int FROM paper_comments pc WHERE pc.paper_id = rp.id) AS comment_count,
+        EXISTS (SELECT 1 FROM paper_saves ps WHERE ps.paper_id = rp.id AND ps.user_id = $3) AS saved_by_me,
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi,
+        rp.pdf_filename, rp.pdf_size
       FROM papers rp JOIN users u ON u.id = rp.user_id
-      WHERE rp.status = 'approved'
+      WHERE rp.status = 'published' AND (NOT $4::boolean OR rp.user_id IN (SELECT user_id FROM visible))
     ) feed ORDER BY created_at DESC, type ASC, id::bigint DESC LIMIT $1 OFFSET $2`,
-  [limit + 1, offset, req.userId])
+  [limit + 1, offset, req.userId, followingOnly])
   const hasMore = rows.length > limit
   res.json({ items: rows.slice(0, limit), page, hasMore })
 })
@@ -884,9 +1381,9 @@ app.get('/api/posts/search', auth, async (req, res) => {
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(
     `SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id,
-      u.name AS author_name, u.role AS author_role,
+      u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
-      (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+      (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count, (SELECT count(*)::int FROM post_views pv WHERE pv.post_id = p.id) AS view_count,
       EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
       (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count
      FROM posts p JOIN users u ON u.id = p.user_id
@@ -909,33 +1406,259 @@ app.get('/api/papers/search', auth, async (req, res) => {
 
 app.get('/api/papers/categories', auth, async (_req, res) => {
   const { rows } = await pool.query(
-    `SELECT DISTINCT domain FROM papers WHERE status = 'approved' ORDER BY lower(domain), domain`
+    `SELECT domain FROM papers WHERE status = 'published' GROUP BY domain ORDER BY lower(domain), domain`
   )
   res.json(rows.map(({ domain }) => domain))
+})
+
+app.get('/api/papers/trending-tags', auth, async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT min(tag) AS tag, count(*)::int AS paper_count
+     FROM papers p, unnest(p.tags) AS t(tag)
+     WHERE p.status = 'published' AND COALESCE(p.published_at, p.created_at) > now() - interval '180 days'
+     GROUP BY lower(tag) ORDER BY paper_count DESC, lower(tag) LIMIT 8`
+  )
+  res.json(rows)
+})
+
+const RECOMMEND_COLUMNS = `p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.user_id,
+  p.reviewed_at, p.published_at, p.created_at, u.name AS submitter_name,
+  (SELECT count(*)::int FROM paper_likes pl WHERE pl.paper_id = p.id) AS like_count, (SELECT count(*)::int FROM paper_views pw WHERE pw.paper_id = p.id) AS view_count,
+  (SELECT count(*)::int FROM paper_saves ps WHERE ps.paper_id = p.id) AS save_count`
+
+const loadCandidates = async () => (await pool.query(
+  `SELECT ${RECOMMEND_COLUMNS} FROM papers p JOIN users u ON u.id = p.user_id
+   WHERE p.status = 'published' ORDER BY COALESCE(p.published_at, p.created_at) DESC LIMIT 500`
+)).rows
+
+async function loadInterestProfile(userId) {
+  const [{ rows: profiles }, { rows: engaged }, { rows: follows }] = await Promise.all([
+    pool.query('SELECT research_interests FROM user_profiles WHERE user_id = $1', [userId]),
+    pool.query(
+      `SELECT DISTINCT ON (p.id) p.id, p.title, p.domain, p.tags, e.kind
+       FROM (
+         SELECT id AS paper_id, 'own' AS kind, 1 AS rank FROM papers
+           WHERE user_id = $1::int OR authors @> jsonb_build_array(jsonb_build_object('user_id', $1::int))
+         UNION ALL SELECT paper_id, 'saved', 2 FROM paper_saves WHERE user_id = $1::int
+         UNION ALL SELECT paper_id, 'liked', 3 FROM paper_likes WHERE user_id = $1::int
+         UNION ALL SELECT paper_id, 'commented', 4 FROM paper_comments WHERE user_id = $1::int
+       ) e JOIN papers p ON p.id = e.paper_id
+       ORDER BY p.id, e.rank LIMIT 300`,
+      [userId]
+    ),
+    pool.query('SELECT followee_id FROM follows WHERE follower_id = $1', [userId]),
+  ])
+  return {
+    profile: buildProfile({
+      interests: profiles[0]?.research_interests ?? [],
+      engaged: engaged.map(({ kind, ...paper }) => ({ paper, kind })),
+      followedIds: follows.map((row) => row.followee_id),
+    }),
+    seen: engaged.filter((row) => row.kind !== 'commented').map((row) => String(row.id)),
+    hasInterests: (profiles[0]?.research_interests ?? []).length > 0,
+  }
+}
+
+app.get('/api/papers/recommendations', auth, async (req, res) => {
+  const limit = Math.max(1, Math.min(12, Number.parseInt(req.query.limit, 10) || 6))
+  const [{ profile, seen, hasInterests }, candidates] = await Promise.all([loadInterestProfile(req.userId), loadCandidates()])
+  res.json({
+    personalised: !profile.empty,
+    hasInterests,
+    basedOn: topInterests(profile, 5),
+    items: recommendPapers(profile, candidates, { exclude: seen, limit }),
+    topics: relatedTopics(profile, candidates, { limit: 8 }),
+  })
+})
+
+app.get('/api/search/suggest', auth, async (req, res) => {
+  const q = String(req.query.q ?? '').trim().slice(0, 100)
+  if (q.length < 2) return res.json({ topics: [], papers: [], people: [] })
+  const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
+  const [candidates, { rows: papers }, { rows: people }] = await Promise.all([
+    loadCandidates(),
+    pool.query(
+      `SELECT p.id, p.title, p.domain FROM papers p
+       WHERE p.status = 'published' AND (p.title ILIKE $1 OR array_to_string(p.tags, ' ') ILIKE $1)
+       ORDER BY (p.title ILIKE $2) DESC, COALESCE(p.published_at, p.created_at) DESC LIMIT 4`,
+      [pattern, `${q.replace(/[\\%_]/g, '\\$&')}%`]
+    ),
+    pool.query(
+      `SELECT u.id, u.name, u.profile_image_id, COALESCE(up.institution, '') AS institution
+       FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id
+       WHERE u.email_verified_at IS NOT NULL AND (u.name ILIKE $1 OR array_to_string(up.research_interests, ' ') ILIKE $1)
+       ORDER BY (u.name ILIKE $2) DESC, u.name LIMIT 4`,
+      [pattern, `${q.replace(/[\\%_]/g, '\\$&')}%`]
+    ),
+  ])
+  res.json({
+    topics: suggestTopics(q, candidates, { limit: 5 }),
+    papers,
+    people: people.map(({ profile_image_id, ...person }) => ({ ...person, avatar_url: profile_image_id ? `/api/images/${profile_image_id}` : null })),
+  })
+})
+
+app.get('/api/papers/:id/related', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(
+    `SELECT ${RECOMMEND_COLUMNS} FROM papers p JOIN users u ON u.id = p.user_id WHERE p.id = $1 AND p.status = 'published'`,
+    [req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
+  res.json(similarPapers(rows[0], await loadCandidates(), { limit: 4 }))
+})
+
+app.get('/api/papers/saved', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.user_id, p.reviewed_at, p.published_at, p.created_at,
+       u.name AS submitter_name, ps.created_at AS saved_at
+     FROM paper_saves ps JOIN papers p ON p.id = ps.paper_id JOIN users u ON u.id = p.user_id
+     WHERE ps.user_id = $1 AND p.status = 'published'
+     ORDER BY ps.created_at DESC LIMIT 200`,
+    [req.userId]
+  )
+  res.json(rows)
+})
+
+app.get('/api/papers/my-submissions', auth, async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT papers.id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
+      status, rejection_reason, revision_note, round, resubmitted_at, reviewed_at, published_at, papers.created_at,
+      papers.user_id <> $1 AS coauthored, submitter.name AS submitter_name,
+      (SELECT count(*)::int FROM peer_reviews r WHERE r.paper_id = papers.id AND r.round = papers.round) AS review_count,
+      (SELECT count(*)::int FROM jsonb_array_elements(papers.authors) WITH ORDINALITY AS a(v, i) WHERE i > 1 AND v ? 'user_id') AS coauthor_count,
+      (SELECT count(*)::int FROM coauthor_checks c WHERE c.paper_id = papers.id AND c.round = papers.round
+        AND c.draft = papers.draft AND c.decision = 'approve') AS coauthor_approvals,
+      (SELECT c.decision FROM coauthor_checks c WHERE c.paper_id = papers.id AND c.round = papers.round
+        AND c.draft = papers.draft AND c.user_id = $1) AS my_check
+    FROM papers JOIN users submitter ON submitter.id = papers.user_id
+    WHERE papers.user_id = $1 OR papers.authors @> jsonb_build_array(jsonb_build_object('user_id', $1::int))
+    ORDER BY COALESCE(resubmitted_at, papers.created_at) DESC`, [req.userId])
+  res.json(rows)
 })
 
 app.get('/api/papers/:id', auth, async (req, res) => {
   if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
   const { rows } = await pool.query(
     `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors,
-      p.reviewed_at, p.created_at, u.name AS submitter_name
+      p.reviewed_at, p.published_at, p.created_at, p.user_id, u.name AS submitter_name, p.round, p.pdf_filename, p.pdf_size,
+      (SELECT count(DISTINCT r.reviewer_id)::int FROM peer_reviews r WHERE r.paper_id = p.id) AS reviewer_count,
+      (SELECT round(avg(r.overall_rating), 1)::float FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round) AS avg_rating,
+      (SELECT count(*)::int FROM paper_likes pl WHERE pl.paper_id = p.id) AS like_count, (SELECT count(*)::int FROM paper_views pw WHERE pw.paper_id = p.id) AS view_count,
+      EXISTS (SELECT 1 FROM paper_likes pl WHERE pl.paper_id = p.id AND pl.user_id = $2) AS liked_by_me,
+      (SELECT count(*)::int FROM paper_comments pc WHERE pc.paper_id = p.id) AS comment_count,
+      EXISTS (SELECT 1 FROM paper_saves ps WHERE ps.paper_id = p.id AND ps.user_id = $2) AS saved_by_me
      FROM papers p JOIN users u ON u.id = p.user_id
-     WHERE p.id = $1 AND p.status = 'approved'`,
-    [req.params.id]
+     WHERE p.id = $1 AND p.status = 'published'`,
+    [req.params.id, req.userId]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
   res.json(rows[0])
 })
 
-// Multipart: "body" text plus an optional "image" file
-app.post('/api/posts', auth, upload.single('image'), async (req, res) => {
+const approvedPaperExists = async (id) => (await pool.query("SELECT 1 FROM papers WHERE id = $1 AND status = 'published'", [id])).rowCount > 0
+
+app.put('/api/papers/:id/like', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  if (typeof req.body?.liked !== 'boolean') return res.status(400).json({ error: 'liked must be true or false' })
+  if (!await approvedPaperExists(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  if (req.body.liked) {
+    await pool.query(`WITH inserted AS (
+        INSERT INTO paper_likes (paper_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING paper_id, user_id
+      ), notified AS (
+        INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+        SELECT p.user_id, inserted.user_id, 'paper_like', 'paper', p.id, actor.name || ' liked your paper "' || left(p.title, 80) || '"'
+        FROM inserted JOIN papers p ON p.id = inserted.paper_id JOIN users actor ON actor.id = inserted.user_id
+        WHERE p.user_id <> inserted.user_id RETURNING id
+      ) SELECT 1 FROM inserted`, [req.params.id, req.userId])
+  } else {
+    await pool.query('DELETE FROM paper_likes WHERE paper_id = $1 AND user_id = $2', [req.params.id, req.userId])
+  }
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS like_count, EXISTS (
+       SELECT 1 FROM paper_likes WHERE paper_id = $1 AND user_id = $2
+     ) AS liked_by_me FROM paper_likes WHERE paper_id = $1`,
+    [req.params.id, req.userId]
+  )
+  res.json(rows[0])
+})
+
+app.put('/api/papers/:id/save', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  if (typeof req.body?.saved !== 'boolean') return res.status(400).json({ error: 'saved must be true or false' })
+  if (!await approvedPaperExists(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  if (req.body.saved) {
+    await pool.query('INSERT INTO paper_saves (user_id, paper_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.userId, req.params.id])
+  } else {
+    await pool.query('DELETE FROM paper_saves WHERE user_id = $1 AND paper_id = $2', [req.userId, req.params.id])
+  }
+  res.json({ saved_by_me: req.body.saved })
+})
+
+const PAPER_COMMENT_COLUMNS = `c.id, c.paper_id, c.user_id, c.body, c.created_at,
+  u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url`
+
+app.get('/api/papers/:id/comments', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  if (!await approvedPaperExists(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(
+    `SELECT * FROM (
+       SELECT ${PAPER_COMMENT_COLUMNS} FROM paper_comments c JOIN users u ON u.id = c.user_id
+       WHERE c.paper_id = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+     ) recent ORDER BY created_at, id`,
+    [req.params.id]
+  )
+  res.json(rows)
+})
+
+app.post('/api/papers/:id/comments', auth, writeLimiter, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const body = typeof req.body?.body === 'string' ? req.body.body.trim() : ''
+  if (!body || body.length > 2000) return res.status(400).json({ error: 'Comment must be 1-2,000 characters', field: 'body' })
+  const { rows } = await pool.query(`WITH inserted AS (
+      INSERT INTO paper_comments (paper_id, user_id, body)
+      SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM papers WHERE id = $1 AND status = 'published')
+      RETURNING id, paper_id, user_id
+    ), notified AS (
+      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+      SELECT p.user_id, inserted.user_id, 'paper_comment', 'paper', p.id, actor.name || ' commented on your paper "' || left(p.title, 80) || '"'
+      FROM inserted JOIN papers p ON p.id = inserted.paper_id JOIN users actor ON actor.id = inserted.user_id
+      WHERE p.user_id <> inserted.user_id RETURNING id
+    ) SELECT id FROM inserted`, [req.params.id, req.userId, body])
+  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
+  const comment = await pool.query(
+    `SELECT ${PAPER_COMMENT_COLUMNS} FROM paper_comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
+    [rows[0].id]
+  )
+  res.status(201).json(comment.rows[0])
+})
+
+app.delete('/api/paper-comments/:id', auth, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Comment not found' })
+  const { rows } = await pool.query(
+    `WITH d AS (
+       DELETE FROM paper_comments c USING papers p
+       WHERE c.id = $1 AND p.id = c.paper_id AND (c.user_id = $2 OR p.user_id = $2 OR $3)
+       RETURNING c.id, c.paper_id, c.user_id, p.user_id AS submitter_id
+     ), logged AS (
+       INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       SELECT $2, 'paper_comment.remove', 'paper_comment', d.id::text, jsonb_build_object('paperId', d.paper_id, 'authorId', d.user_id)
+       FROM d WHERE d.user_id <> $2 AND d.submitter_id <> $2
+     )
+     SELECT count(*)::int AS n FROM d`,
+    [req.params.id, req.userId, isModerator(req)]
+  )
+  if (!rows[0].n) return res.status(404).json({ error: 'Comment not found' })
+  res.status(204).end()
+})
+
+app.post('/api/posts', auth, writeLimiter, upload.single('image'), async (req, res) => {
   const body = String(req.body?.body ?? '').trim()
   const mime = req.file && sniffImage(req.file.buffer)
   if (req.file && !mime) return res.status(400).json({ error: 'Image must be a JPEG, PNG, GIF or WebP file' })
   if (!body && !req.file) return res.status(400).json({ error: 'Write something or add an image' })
   if (body.length > 5000) return res.status(400).json({ error: 'Post must be under 5000 characters' })
 
-  // One statement, so the image and post are saved together or not at all
   const { rows } = await pool.query(
     `WITH img AS (INSERT INTO images (user_id, mime, data) SELECT $1, $3, $4 WHERE $4::bytea IS NOT NULL RETURNING id)
      INSERT INTO posts (user_id, body, image_id) VALUES ($1, $2, (SELECT id FROM img)) RETURNING id`,
@@ -959,6 +1682,615 @@ app.patch('/api/posts/:id', auth, async (req, res) => {
   )
   const result = await pool.query(`${POST_SELECT} WHERE p.id = $1`, [updated.rows[0].id, req.userId])
   res.json(result.rows[0])
+})
+
+const STORY_SELECT = `SELECT s.id, s.user_id, s.kind, s.audience, s.caption, s.created_at, s.expires_at, s.clip_start, s.clip_end, s.part, s.parts, s.background, s.overlay,
+    '/api/images/' || s.image_id::text AS image_url, '/api/story-media/' || s.media_id::text AS media_url,
+    u.name, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
+    EXISTS (SELECT 1 FROM story_views v WHERE v.story_id = s.id AND v.viewer_id = $1) AS seen,
+    CASE WHEN s.user_id = $1 THEN (SELECT count(*)::int FROM story_views v WHERE v.story_id = s.id AND v.viewer_id <> s.user_id) END AS view_count
+  FROM stories s JOIN users u ON u.id = s.user_id`
+const STORY_VISIBLE = `s.expires_at > now() AND u.blocked_at IS NULL
+  AND (s.user_id = $1 OR (EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = s.user_id)
+    AND (s.audience = 'followers' OR EXISTS (SELECT 1 FROM follows back WHERE back.follower_id = s.user_id AND back.followee_id = $1))))`
+const storyUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: STORY_VIDEO_MAX_BYTES, files: 1, fields: 10, fieldSize: 64 * 1024 } })
+
+app.get('/api/stories', auth, async (req, res) => {
+  const { rows } = await pool.query(`${STORY_SELECT} WHERE ${STORY_VISIBLE} ORDER BY s.created_at DESC, s.part NULLS FIRST LIMIT 300`, [req.userId])
+  res.json(groupStories(rows, req.userId))
+})
+
+app.post('/api/stories', auth, writeLimiter, (req, res, next) => storyUpload.single('media')(req, res, (err) => {
+  if (err?.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Videos must be 40 MB or smaller and photos 5 MB or smaller', field: 'media' })
+  return next(err)
+}), async (req, res) => {
+  const kind = String(req.body?.kind ?? (req.file ? 'image' : ''))
+  if (!STORY_KINDS.includes(kind)) return res.status(400).json({ error: 'Choose a photo or video, or write some text' })
+  const overlay = parseOverlay(req.body?.overlay)
+  if (overlay.error) return res.status(400).json({ error: overlay.error, field: 'overlay' })
+  const audience = req.body?.audience === undefined || req.body.audience === '' ? 'followers' : String(req.body.audience)
+  if (!['followers', 'friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
+
+  let mime = null
+  let parts = [null]
+  let background = null
+  if (kind === 'text') {
+    background = String(req.body?.background ?? '')
+    if (!STORY_BACKGROUNDS.includes(background)) return res.status(400).json({ error: 'Choose a background for your text story' })
+    if (!overlay.layers.length) return res.status(400).json({ error: 'Write something for your text story' })
+  } else {
+    if (!req.file) return res.status(400).json({ error: kind === 'video' ? 'Choose a video for your story' : 'Choose a photo for your story', field: 'media' })
+    if (kind === 'image') {
+      mime = sniffImage(req.file.buffer)
+      if (!mime) return res.status(400).json({ error: 'Photo must be a JPEG, PNG, GIF or WebP image', field: 'media' })
+      if (req.file.size > STORY_IMAGE_MAX_BYTES) return res.status(413).json({ error: 'Photos must be 5 MB or smaller', field: 'media' })
+    } else {
+      mime = sniffVideo(req.file.buffer)
+      if (!mime) return res.status(400).json({ error: 'Video must be an MP4, MOV or WebM file', field: 'media' })
+      const reported = Number(req.body?.duration)
+      const duration = (mime === 'video/webm' ? null : mp4Duration(req.file.buffer)) ?? (Number.isFinite(reported) && reported > 0 ? reported : null)
+      if (!duration) return res.status(400).json({ error: 'This video could not be read. Try another one.', field: 'media' })
+      if (duration > STORY_VIDEO_MAX_SECONDS + 0.5) return res.status(400).json({ error: `Videos can be up to ${STORY_VIDEO_MAX_SECONDS} seconds long`, field: 'media' })
+      parts = splitVideo(Math.min(duration, STORY_VIDEO_MAX_SECONDS))
+    }
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    let mentioned = []
+    if (overlay.mentionIds.length) {
+      const friends = await client.query(
+        `SELECT u.id, u.name FROM users u
+         WHERE u.id = ANY($2::int[]) AND u.blocked_at IS NULL
+           AND EXISTS (SELECT 1 FROM follows a WHERE a.follower_id = $1 AND a.followee_id = u.id)
+           AND EXISTS (SELECT 1 FROM follows b WHERE b.follower_id = u.id AND b.followee_id = $1)`,
+        [req.userId, overlay.mentionIds]
+      )
+      if (friends.rows.length !== overlay.mentionIds.length) {
+        await client.query('ROLLBACK')
+        return res.status(400).json({ error: 'You can only mention friends: people you follow who follow you back', field: 'overlay' })
+      }
+      mentioned = friends.rows
+    }
+    const names = new Map(mentioned.map((friend) => [friend.id, friend.name]))
+    const layers = overlay.layers.map((layer) => (layer.type === 'mention' ? { ...layer, name: names.get(layer.user_id) } : layer))
+
+    const active = await client.query('SELECT count(*)::int AS n FROM stories WHERE user_id = $1 AND expires_at > now()', [req.userId])
+    if (active.rows[0].n + parts.length > STORY_ACTIVE_LIMIT) {
+      await client.query('ROLLBACK')
+      const left = Math.max(0, STORY_ACTIVE_LIMIT - active.rows[0].n)
+      return res.status(400).json({
+        error: parts.length > 1
+          ? `This video makes ${parts.length} stories but you have room for ${left}. You can have ${STORY_ACTIVE_LIMIT} stories at a time.`
+          : `You can have ${STORY_ACTIVE_LIMIT} stories at a time. Delete one or wait for it to expire.`,
+      })
+    }
+
+    let imageId = null
+    let mediaId = null
+    if (kind === 'image') {
+      imageId = (await client.query('INSERT INTO images (user_id, mime, data) VALUES ($1, $2, $3) RETURNING id', [req.userId, mime, req.file.buffer])).rows[0].id
+    } else if (kind === 'video') {
+      mediaId = (await client.query('INSERT INTO story_media (user_id, mime, data, duration) VALUES ($1, $2, $3, $4) RETURNING id',
+        [req.userId, mime, req.file.buffer, parts[parts.length - 1].end])).rows[0].id
+    }
+    const ids = []
+    for (const [index, part] of parts.entries()) {
+      const { rows } = await client.query(
+        `INSERT INTO stories (user_id, kind, image_id, media_id, clip_start, clip_end, part, parts, background, overlay, audience)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11) RETURNING id`,
+        [req.userId, kind, imageId, mediaId, part?.start ?? null, part?.end ?? null, part ? index + 1 : null, part ? parts.length : null, background, JSON.stringify(layers), audience]
+      )
+      ids.push(rows[0].id)
+    }
+    if (mentioned.length) {
+      await client.query('INSERT INTO story_mentions (story_id, user_id) SELECT $1::bigint, unnest($2::int[]) ON CONFLICT DO NOTHING', [ids[0], mentioned.map((friend) => friend.id)])
+      await client.query(
+        `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+         SELECT unnest($2::int[]), actor.id, 'story_mention', 'story', actor.id, actor.name || ' mentioned you in their story'
+         FROM users actor WHERE actor.id = $1::int`,
+        [req.userId, mentioned.map((friend) => friend.id)]
+      )
+    }
+    await client.query('COMMIT')
+    const created = await pool.query(`${STORY_SELECT} WHERE s.id = ANY($2::bigint[])`, [req.userId, ids])
+    res.status(201).json({ items: groupStories(created.rows, req.userId)[0]?.items ?? [] })
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+// Video bytes for stories. Supports byte ranges so browsers can stream and seek to each 15 second part.
+app.get('/api/story-media/:id', async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).end()
+  const { rows } = await pool.query('SELECT mime, octet_length(data)::bigint AS size FROM story_media WHERE id = $1', [req.params.id])
+  if (!rows[0]) return res.status(404).end()
+  const size = Number(rows[0].size)
+  const headers = { 'Content-Type': rows[0].mime, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=86400', 'Cross-Origin-Resource-Policy': 'same-origin' }
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? '').trim())
+  let start = 0
+  let end = size - 1
+  if (match && (match[1] || match[2])) {
+    if (match[1] === '') start = Math.max(0, size - Number(match[2]))
+    else {
+      start = Number(match[1])
+      if (match[2]) end = Math.min(Number(match[2]), size - 1)
+    }
+    if (start > end || start >= size) return res.status(416).set({ ...headers, 'Content-Range': `bytes */${size}` }).end()
+    end = Math.min(end, start + 4 * 1024 * 1024 - 1)
+  }
+  const length = end - start + 1
+  const chunk = await pool.query('SELECT substring(data FROM $2 FOR $3) AS bytes FROM story_media WHERE id = $1', [req.params.id, start + 1, length])
+  if (!chunk.rows[0]) return res.status(404).end()
+  res.status(match && (match[1] || match[2]) ? 206 : 200).set({
+    ...headers,
+    'Content-Length': String(length),
+    ...(match && (match[1] || match[2]) ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}),
+  }).end(chunk.rows[0].bytes)
+})
+
+app.get('/api/stories/:id/viewers', auth, async (req, res) => {
+  if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
+  const story = await pool.query('SELECT user_id FROM stories WHERE id = $1', [req.params.id])
+  if (!story.rows[0] || String(story.rows[0].user_id) !== String(req.userId)) return res.status(404).json({ error: 'Story not found' })
+  const { rows } = await pool.query(
+    `SELECT u.id, u.name, v.viewed_at,
+       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
+       EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followee_id = u.id) AS followed_by_me
+     FROM story_views v JOIN users u ON u.id = v.viewer_id
+     WHERE v.story_id = $1 AND v.viewer_id <> $2 AND u.blocked_at IS NULL
+     ORDER BY v.viewed_at DESC LIMIT 500`,
+    [req.params.id, req.userId],
+  )
+  res.json(rows)
+})
+
+// Changes who can see a story; all parts of a split video change together.
+app.put('/api/stories/:id/audience', auth, writeLimiter, async (req, res) => {
+  if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
+  const audience = String(req.body?.audience ?? '')
+  if (!['followers', 'friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
+  const { rows } = await pool.query(
+    `UPDATE stories s SET audience = $3
+     FROM stories target
+     WHERE target.id = $1 AND target.user_id = $2 AND s.user_id = $2
+       AND (s.id = target.id OR (target.media_id IS NOT NULL AND s.media_id = target.media_id))
+     RETURNING s.id`,
+    [req.params.id, req.userId, audience],
+  )
+  if (!rows.length) return res.status(404).json({ error: 'Story not found' })
+  res.json({ audience, ids: rows.map((row) => String(row.id)) })
+})
+
+app.post('/api/stories/:id/view', auth, async (req, res) => {
+  if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
+  const { rowCount } = await pool.query(
+    `INSERT INTO story_views (story_id, viewer_id)
+     SELECT s.id, $1 FROM stories s JOIN users u ON u.id = s.user_id WHERE s.id = $2 AND ${STORY_VISIBLE}
+     ON CONFLICT DO NOTHING`,
+    [req.userId, req.params.id]
+  )
+  const exists = rowCount || (await pool.query('SELECT 1 FROM story_views WHERE story_id = $1 AND viewer_id = $2', [req.params.id, req.userId])).rowCount
+  if (!exists) return res.status(404).json({ error: 'Story not found' })
+  res.status(204).end()
+})
+
+const removeUnusedStoryMedia = (db) => db.query(
+  `DELETE FROM story_media m WHERE m.created_at < now() - interval '10 minutes' AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.media_id = m.id)`
+)
+
+app.delete('/api/stories/:id', auth, async (req, res) => {
+  if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
+  const { rows } = await pool.query(
+    `WITH gone AS (DELETE FROM stories WHERE id = $1 AND user_id = $2 RETURNING image_id, media_id),
+     images_gone AS (DELETE FROM images WHERE id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL))
+     SELECT media_id FROM gone`,
+    [req.params.id, req.userId]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Story not found' })
+  if (rows[0].media_id) {
+    await pool.query('DELETE FROM story_media m WHERE m.id = $1 AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.media_id = m.id)', [rows[0].media_id])
+  }
+  res.status(204).end()
+})
+
+const removeExpiredStories = () => pool.query(
+  `WITH gone AS (DELETE FROM stories WHERE expires_at < now() - interval '1 hour' RETURNING image_id)
+   DELETE FROM images WHERE id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL)`
+).then(() => removeUnusedStoryMedia(pool))
+  .catch((err) => log('error', 'story_cleanup_failed', { code: err.code ?? 'unknown' }))
+setInterval(removeExpiredStories, 60 * 60 * 1000).unref()
+
+// Reels: short vertical videos. Browsers upload the file straight to ImageKit with a short-lived signature,
+// then publish it here; the server re-reads the file from ImageKit and only trusts what ImageKit reports.
+const REEL_PAGE = 8
+const REEL_COLUMNS = `r.id, r.user_id, r.caption, r.video_url, r.mime, r.duration, r.width, r.height,
+  CASE WHEN r.cover_image_id IS NULL THEN r.thumbnail_url ELSE '/api/images/' || r.cover_image_id::text END AS thumbnail_url,
+  r.trim_start, r.trim_end, r.crop, r.filter, r.audio_muted, r.hide_counts, r.comments_off, r.alt_text, r.location,
+  CASE WHEN r.user_id = $1 THEN r.view_count END AS view_count, r.created_at, u.name AS author_name,
+  CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
+  CASE WHEN r.hide_counts AND r.user_id <> $1 THEN NULL
+    ELSE (SELECT count(*)::int FROM reel_likes l WHERE l.reel_id = r.id) END AS like_count,
+  EXISTS (SELECT 1 FROM reel_likes l WHERE l.reel_id = r.id AND l.user_id = $1) AS liked_by_me,
+  (SELECT count(*)::int FROM reel_comments c WHERE c.reel_id = r.id) AS comment_count,
+  EXISTS (SELECT 1 FROM reel_saves s WHERE s.reel_id = r.id AND s.user_id = $1) AS saved_by_me,
+  EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = r.user_id) AS following_author,
+  COALESCE((SELECT json_agg(json_build_object('id', tu.id, 'name', tu.name) ORDER BY lower(tu.name))
+    FROM reel_tags t JOIN users tu ON tu.id = t.user_id WHERE t.reel_id = r.id AND tu.blocked_at IS NULL), '[]') AS tags`
+const REEL_COMMENT_COLUMNS = `c.id, c.reel_id, c.user_id, c.body, c.created_at, u.name AS author_name,
+  CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url`
+const reelsOff = (res) => res.status(503).json({ error: 'Reels uploads are not set up on this server yet' })
+
+const removeReelFile = async (fileId) => {
+  if (!IMAGEKIT) return
+  try {
+    if (await deleteFile(IMAGEKIT, fileId)) return
+  } catch { /* retried below */ }
+  await pool.query('INSERT INTO reel_file_trash (file_id) VALUES ($1) ON CONFLICT DO NOTHING', [fileId])
+}
+
+app.get('/api/reels/config', auth, (_req, res) => {
+  res.json({ enabled: !!IMAGEKIT, max_bytes: 100 * 1024 * 1024, max_seconds: 180 })
+})
+
+app.get('/api/reels/upload-auth', auth, writeLimiter, (_req, res) => {
+  if (!IMAGEKIT) return reelsOff(res)
+  res.set('Cache-Control', 'no-store').json(uploadAuth(IMAGEKIT))
+})
+
+app.get('/api/reels', auth, async (req, res) => {
+  const values = [req.userId]
+  const where = ['u.blocked_at IS NULL']
+  const userId = typeof req.query.user === 'string' && isPgId(req.query.user) ? req.query.user : null
+  if (userId) where.push(`r.user_id = $${values.push(userId)}`)
+  if (req.query.saved === '1') where.push('EXISTS (SELECT 1 FROM reel_saves s WHERE s.reel_id = r.id AND s.user_id = $1)')
+  const first = typeof req.query.first === 'string' && isPgBigId(req.query.first) ? req.query.first : null
+  if (first) where.push(`r.id <> $${values.push(first)}`)
+  const cursor = typeof req.query.after === 'string' ? /^(\d{4}-\d\d-\d\dT[\d:.]+Z)_(\d{1,18})$/.exec(req.query.after) : null
+  if (cursor && !Number.isNaN(Date.parse(cursor[1]))) {
+    where.push(`(r.created_at, r.id) < ($${values.push(cursor[1])}::timestamptz, $${values.push(cursor[2])}::bigint)`)
+  }
+  const { rows } = await pool.query(
+    `SELECT ${REEL_COLUMNS} FROM reels r JOIN users u ON u.id = r.user_id
+     WHERE ${where.join(' AND ')} ORDER BY r.created_at DESC, r.id DESC LIMIT ${REEL_PAGE + 1}`,
+    values,
+  )
+  const items = rows.slice(0, REEL_PAGE)
+  if (first && !cursor) {
+    const pinned = await pool.query(
+      `SELECT ${REEL_COLUMNS} FROM reels r JOIN users u ON u.id = r.user_id WHERE r.id = $2 AND u.blocked_at IS NULL`,
+      [req.userId, first],
+    )
+    if (pinned.rows[0]) items.unshift(pinned.rows[0])
+  }
+  const last = rows.length > REEL_PAGE ? rows[REEL_PAGE - 1] : null
+  res.json({ items, next: last ? `${new Date(last.created_at).toISOString()}_${last.id}` : null })
+})
+
+const reelForm = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024, files: 1, fields: 30 } })
+const reelOne = (viewerId, id) => pool.query(`SELECT ${REEL_COLUMNS} FROM reels r JOIN users u ON u.id = r.user_id WHERE r.id = $2`, [viewerId, id])
+
+app.post('/api/reels', auth, writeLimiter, (req, res, next) => reelForm.single('cover')(req, res, (err) => {
+  if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'The cover photo must be 2 MB or smaller' : 'The reel could not be read', field: 'cover' })
+  next()
+}), async (req, res) => {
+  if (!IMAGEKIT) return reelsOff(res)
+  const fileId = req.body?.fileId
+  const caption = typeof req.body?.caption === 'string' ? req.body.caption.replace(/\r\n?/g, '\n').trim() : ''
+  const captionError = reelCaptionProblem(req.body?.caption)
+  if (captionError) return res.status(400).json({ error: captionError, field: 'caption' })
+  if (!isFileId(fileId)) return res.status(400).json({ error: 'Upload the video first' })
+  const coverMime = req.file ? sniffImage(req.file.buffer) : null
+  if (req.file && !['image/jpeg', 'image/png', 'image/webp'].includes(coverMime)) return res.status(400).json({ error: 'The cover photo must be a JPEG, PNG or WebP image', field: 'cover' })
+  let file
+  try { file = await fileDetails(IMAGEKIT, fileId) } catch (err) {
+    log('error', 'reel_details_failed', { message: err.message })
+    return res.status(502).json({ error: 'Could not reach the video service. Please try again.' })
+  }
+  const problem = reelFileProblem(file, IMAGEKIT)
+  if (problem) {
+    if (typeof file?.filePath === 'string' && file.filePath.startsWith(`${REEL_FOLDER}/`)) await removeReelFile(fileId)
+    return res.status(400).json({ error: problem })
+  }
+  const duration = Number.isFinite(file.duration) && file.duration > 0 ? file.duration : null
+  const parsed = parseReelOptions(req.body, duration)
+  if (parsed.error) return res.status(400).json({ error: parsed.error, field: parsed.field })
+  const options = parsed.value
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    let tagged = []
+    if (options.tags.length) {
+      tagged = (await client.query('SELECT id FROM users WHERE id = ANY($1::int[]) AND id <> $2 AND blocked_at IS NULL', [options.tags, req.userId])).rows.map((row) => row.id)
+    }
+    const cover = req.file
+      ? (await client.query('INSERT INTO images (user_id, mime, data) VALUES ($1, $2, $3) RETURNING id', [req.userId, coverMime, req.file.buffer])).rows[0].id
+      : null
+    // Serve the original upload: plain ImageKit video URLs go through its video processing, which has a
+    // monthly quota and returns 403 once it is used up. Crop, trim and filters are applied by the player instead.
+    const videoUrl = `${IMAGEKIT.endpoint}/tr:orig-true${file.url.slice(IMAGEKIT.endpoint.length).split('?')[0]}`
+    const { rows } = await client.query(
+      `INSERT INTO reels (user_id, caption, file_id, video_url, mime, file_size, duration, width, height, cover_image_id,
+         trim_start, trim_end, crop, filter, audio_muted, hide_counts, comments_off, alt_text, location)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19) RETURNING id`,
+      [req.userId, caption, fileId, videoUrl, file.mime, file.size, duration,
+        Number.isSafeInteger(file.width) ? file.width : null, Number.isSafeInteger(file.height) ? file.height : null, cover,
+        options.trimStart, options.trimEnd, JSON.stringify(options.crop), options.filter, options.audioMuted,
+        options.hideCounts, options.commentsOff, options.altText, options.location],
+    )
+    const reelId = rows[0].id
+    if (tagged.length) {
+      await client.query('INSERT INTO reel_tags (reel_id, user_id) SELECT $1::bigint, unnest($2::int[]) ON CONFLICT DO NOTHING', [reelId, tagged])
+      await client.query(
+        `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+         SELECT unnest($2::int[]), actor.id, 'reel_tag', 'reel', $3::bigint, actor.name || ' tagged you in their reel'
+         FROM users actor WHERE actor.id = $1::int`,
+        [req.userId, tagged, reelId],
+      )
+    }
+    await client.query('COMMIT')
+    res.status(201).json((await reelOne(req.userId, reelId)).rows[0])
+  } catch (err) {
+    await client.query('ROLLBACK')
+    if (err.code === '23505') return res.status(409).json({ error: 'This video is already shared as a reel' })
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+app.patch('/api/reels/:id', auth, writeLimiter, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  const parsed = parseReelSettings(req.body ?? {})
+  if (parsed.error) return res.status(400).json({ error: parsed.error, field: parsed.field })
+  const sets = []
+  const values = [req.params.id, req.userId]
+  if (req.body?.caption !== undefined) {
+    const captionError = reelCaptionProblem(req.body.caption)
+    if (captionError) return res.status(400).json({ error: captionError, field: 'caption' })
+    sets.push(`caption = $${values.push(String(req.body.caption).replace(/\r\n?/g, '\n').trim())}`)
+  }
+  const columns = { altText: 'alt_text', location: 'location', hideCounts: 'hide_counts', commentsOff: 'comments_off' }
+  for (const [key, column] of Object.entries(columns)) if (key in parsed.value) sets.push(`${column} = $${values.push(parsed.value[key])}`)
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' })
+  const { rowCount } = await pool.query(`UPDATE reels SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2`, values)
+  if (!rowCount) return res.status(404).json({ error: 'Reel not found' })
+  res.json((await reelOne(req.userId, req.params.id)).rows[0])
+})
+
+app.post('/api/reels/:id/view', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  await pool.query('UPDATE reels SET view_count = view_count + 1 WHERE id = $1 AND user_id <> $2', [req.params.id, req.userId])
+  res.status(204).end()
+})
+
+app.put('/api/reels/:id/like', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  if (typeof req.body?.liked !== 'boolean') return res.status(400).json({ error: 'liked must be true or false' })
+  const reel = await pool.query('SELECT 1 FROM reels WHERE id = $1', [req.params.id])
+  if (!reel.rows[0]) return res.status(404).json({ error: 'Reel not found' })
+  if (req.body.liked) {
+    await pool.query(`WITH inserted AS (
+        INSERT INTO reel_likes (reel_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING reel_id, user_id
+      ), notified AS (
+        INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+        SELECT r.user_id, inserted.user_id, 'reel_like', 'reel', r.id, actor.name || ' liked your reel'
+        FROM inserted JOIN reels r ON r.id = inserted.reel_id JOIN users actor ON actor.id = inserted.user_id
+        WHERE r.user_id <> inserted.user_id RETURNING id
+      ) SELECT reel_id FROM inserted`, [req.params.id, req.userId])
+  } else {
+    await pool.query('DELETE FROM reel_likes WHERE reel_id = $1 AND user_id = $2', [req.params.id, req.userId])
+  }
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS like_count, EXISTS (SELECT 1 FROM reel_likes WHERE reel_id = $1 AND user_id = $2) AS liked_by_me
+     FROM reel_likes WHERE reel_id = $1`,
+    [req.params.id, req.userId],
+  )
+  res.json(rows[0])
+})
+
+app.put('/api/reels/:id/save', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  if (typeof req.body?.saved !== 'boolean') return res.status(400).json({ error: 'saved must be true or false' })
+  const reel = await pool.query('SELECT 1 FROM reels WHERE id = $1', [req.params.id])
+  if (!reel.rows[0]) return res.status(404).json({ error: 'Reel not found' })
+  if (req.body.saved) await pool.query('INSERT INTO reel_saves (reel_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.params.id, req.userId])
+  else await pool.query('DELETE FROM reel_saves WHERE reel_id = $1 AND user_id = $2', [req.params.id, req.userId])
+  res.json({ saved_by_me: req.body.saved })
+})
+
+app.get('/api/reels/:id/comments', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  const { rows } = await pool.query(
+    `SELECT * FROM (
+       SELECT ${REEL_COMMENT_COLUMNS} FROM reel_comments c JOIN users u ON u.id = c.user_id
+       WHERE c.reel_id = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+     ) recent ORDER BY created_at, id`,
+    [req.params.id],
+  )
+  res.json(rows)
+})
+
+app.post('/api/reels/:id/comments', auth, writeLimiter, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  const body = typeof req.body?.body === 'string' ? req.body.body.trim() : ''
+  if (!body || body.length > 2000) return res.status(400).json({ error: 'Comment must be 1-2,000 characters', field: 'body' })
+  const target = await pool.query('SELECT user_id, comments_off FROM reels WHERE id = $1', [req.params.id])
+  if (!target.rows[0]) return res.status(404).json({ error: 'Reel not found' })
+  if (target.rows[0].comments_off && String(target.rows[0].user_id) !== String(req.userId)) {
+    return res.status(403).json({ error: 'Commenting is turned off for this reel' })
+  }
+  const { rows } = await pool.query(`WITH inserted AS (
+      INSERT INTO reel_comments (reel_id, user_id, body)
+      SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM reels WHERE id = $1 AND (NOT comments_off OR user_id = $2))
+      RETURNING id, reel_id, user_id
+    ), notified AS (
+      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+      SELECT r.user_id, inserted.user_id, 'reel_comment', 'reel', r.id, actor.name || ' commented on your reel'
+      FROM inserted JOIN reels r ON r.id = inserted.reel_id JOIN users actor ON actor.id = inserted.user_id
+      WHERE r.user_id <> inserted.user_id RETURNING id
+    ) SELECT id FROM inserted`, [req.params.id, req.userId, body])
+  if (!rows[0]) return res.status(404).json({ error: 'Reel not found' })
+  const comment = await pool.query(`SELECT ${REEL_COMMENT_COLUMNS} FROM reel_comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`, [rows[0].id])
+  res.status(201).json(comment.rows[0])
+})
+
+app.delete('/api/reel-comments/:id', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Comment not found' })
+  const { rows } = await pool.query(
+    `WITH d AS (
+       DELETE FROM reel_comments c USING reels r
+       WHERE c.id = $1 AND r.id = c.reel_id AND (c.user_id = $2 OR r.user_id = $2 OR $3)
+       RETURNING c.id, c.reel_id, c.user_id, r.user_id AS owner_id
+     ), logged AS (
+       INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       SELECT $2, 'reel_comment.remove', 'reel_comment', d.id::text, jsonb_build_object('reelId', d.reel_id, 'authorId', d.user_id)
+       FROM d WHERE d.user_id <> $2 AND d.owner_id <> $2
+     )
+     SELECT count(*)::int AS n FROM d`,
+    [req.params.id, req.userId, isModerator(req)],
+  )
+  if (!rows[0].n) return res.status(404).json({ error: 'Comment not found' })
+  res.status(204).end()
+})
+
+app.delete('/api/reels/:id', auth, async (req, res) => {
+  if (!isPgBigId(req.params.id)) return res.status(404).json({ error: 'Reel not found' })
+  const { rows } = await pool.query(
+    `WITH d AS (DELETE FROM reels WHERE id = $1 AND (user_id = $2 OR $3) RETURNING id, user_id, file_id, cover_image_id),
+     covers AS (DELETE FROM images WHERE id IN (SELECT cover_image_id FROM d WHERE cover_image_id IS NOT NULL)),
+     logged AS (
+       INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       SELECT $2, 'reel.remove', 'reel', d.id::text, jsonb_build_object('authorId', d.user_id)
+       FROM d WHERE d.user_id <> $2
+     )
+     SELECT file_id FROM d`,
+    [req.params.id, req.userId, isModerator(req)],
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Reel not found' })
+  await removeReelFile(rows[0].file_id)
+  res.status(204).end()
+})
+
+// Hourly: retry ImageKit deletes that failed, and remove uploads that were never published as a reel
+// (cancelled uploads, or reels of deleted accounts). Only files inside the reels folder are touched.
+const cleanReelFiles = async () => {
+  if (!IMAGEKIT) return
+  try {
+    const trash = await pool.query('SELECT file_id FROM reel_file_trash ORDER BY created_at LIMIT 50')
+    for (const { file_id: fileId } of trash.rows) {
+      if (await deleteFile(IMAGEKIT, fileId).catch(() => false)) await pool.query('DELETE FROM reel_file_trash WHERE file_id = $1', [fileId])
+    }
+    const files = await listReelFiles(IMAGEKIT)
+    const stale = files.filter((file) => isFileId(file.fileId) && file.filePath?.startsWith(`${REEL_FOLDER}/`)
+      && Date.now() - Date.parse(file.createdAt) > 6 * 60 * 60 * 1000)
+    if (!stale.length) return
+    const known = await pool.query('SELECT file_id FROM reels WHERE file_id = ANY($1::text[])', [stale.map((file) => file.fileId)])
+    const keep = new Set(known.rows.map((row) => row.file_id))
+    for (const file of stale) if (!keep.has(file.fileId)) await deleteFile(IMAGEKIT, file.fileId).catch(() => false)
+  } catch (err) {
+    log('error', 'reel_cleanup_failed', { message: err.message })
+  }
+}
+setInterval(cleanReelFiles, 60 * 60 * 1000).unref()
+
+// SNARP Docs: collaborative research documents (REST here, live editing over the /collaboration WebSocket).
+const collaboration = createCollaborationServer({ pool, jwtSecret: JWT_SECRET })
+app.use('/api/docs', createDocumentsRouter({ pool, auth, writeLimiter, jwtSecret: JWT_SECRET, collaboration }))
+
+// SNARP Guide: the help assistant. Answers stream back as plain text.
+const ASSISTANT = assistantConfig()
+// Staff-only pages (moderator dashboard, admin console) are described only to moderators and the Super Admin.
+const ASSISTANT_SECTIONS = ASSISTANT ? splitGuide(loadGuide()) : []
+const ASSISTANT_STAFF_SECTIONS = ASSISTANT ? [...ASSISTANT_SECTIONS, ...splitGuide(loadGuide(new URL('./assistant-guide-staff.md', import.meta.url)))] : []
+// Groq tells us how long to wait when its per-minute token budget is used up; wait once if it is short.
+const groqRetryMs = (err) => {
+  const match = /try again in ([\d.]+)(ms|s)\b/i.exec(err.detail ?? '')
+  const ms = match ? Number(match[1]) * (match[2].toLowerCase() === 'ms' ? 1 : 1000) : NaN
+  return err.status === 429 && Number.isFinite(ms) && ms <= 12000 ? Math.ceil(ms) + 250 : null
+}
+const assistantLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number.parseInt(process.env.ASSISTANT_RATE_LIMIT, 10) || 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `assistant:${req.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: 'You are asking very quickly. Please wait a minute and try again.' }),
+})
+
+app.get('/api/assistant/status', auth, (_req, res) => {
+  res.json({ enabled: !!ASSISTANT })
+})
+
+app.post('/api/assistant/chat', auth, assistantLimiter, async (req, res) => {
+  if (!ASSISTANT) return res.status(503).json({ error: 'The SNARP Guide is not set up on this server yet' })
+  const chat = validateChat(req.body?.messages)
+  if (chat.error) return res.status(400).json({ error: chat.error })
+  const { rows } = await pool.query('SELECT name, role FROM users WHERE id = $1', [req.userId])
+  const staff = ['moderator', 'admin'].includes(rows[0]?.role)
+  const userTurns = chat.messages.filter((message) => message.role === 'user').slice(-2).map((message) => message.content).join('\n')
+  const guide = selectGuide(staff ? ASSISTANT_STAFF_SECTIONS : ASSISTANT_SECTIONS, { question: userTurns, page: req.body?.page })
+  const system = systemPrompt({ guide, user: rows[0], page: req.body?.page })
+  const controller = new AbortController()
+  res.on('close', () => { if (!res.writableEnded) controller.abort() })
+  let started = false
+  const run = () => streamAnswer({
+    config: ASSISTANT,
+    system,
+    messages: chat.messages,
+    signal: controller.signal,
+    onText: (text) => {
+      if (!started) {
+        started = true
+        res.status(200).set({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' })
+      }
+      res.write(text)
+    },
+  })
+  try {
+    try {
+      await run()
+    } catch (err) {
+      const wait = !started && !controller.signal.aborted ? groqRetryMs(err) : null
+      if (!wait) throw err
+      await new Promise((resolve) => setTimeout(resolve, wait))
+      if (controller.signal.aborted) return
+      await run()
+    }
+    if (!started) res.status(200).type('text/plain').send("Sorry, I couldn't come up with an answer. Please try asking another way.")
+    else res.end()
+  } catch (err) {
+    if (controller.signal.aborted) return
+    log('error', 'assistant_failed', { status: err.status ?? null, detail: err.detail ?? err.message })
+    if (started) return res.end('\n\n_(The answer was cut off. Please try again.)_')
+    const busy = err.status === 429
+    res.status(busy ? 429 : 502).json({ error: busy ? 'The guide is busy right now. Please try again in a minute.' : 'The guide could not answer right now. Please try again.' })
+  }
+})
+
+app.post('/api/views', auth, async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 50) : []
+  const postIds = [...new Set(items.filter((item) => item?.type === 'post' && isPgId(String(item.id))).map((item) => Number(item.id)))]
+  const paperIds = [...new Set(items.filter((item) => item?.type === 'paper' && isPgBigId(String(item.id))).map((item) => String(item.id)))]
+  if (postIds.length) {
+    await pool.query(
+      `INSERT INTO post_views (post_id, user_id)
+       SELECT p.id, $2 FROM posts p WHERE p.id = ANY($1::int[]) AND p.user_id <> $2 ON CONFLICT DO NOTHING`,
+      [postIds, req.userId],
+    )
+  }
+  if (paperIds.length) {
+    await pool.query(
+      `INSERT INTO paper_views (paper_id, user_id)
+       SELECT p.id, $2 FROM papers p WHERE p.id = ANY($1::bigint[]) AND p.user_id <> $2 AND p.status = 'published' ON CONFLICT DO NOTHING`,
+      [paperIds, req.userId],
+    )
+  }
+  res.status(204).end()
 })
 
 app.put('/api/posts/:id/like', auth, async (req, res) => {
@@ -992,7 +2324,7 @@ app.get('/api/posts/:id/comments', auth, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT * FROM (
        SELECT c.id, c.post_id, c.user_id, c.body, c.created_at, c.updated_at,
-         u.name AS author_name, u.role AS author_role,
+         u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
          CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url
        FROM comments c JOIN users u ON u.id = c.user_id
        WHERE c.post_id = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 50
@@ -1002,7 +2334,7 @@ app.get('/api/posts/:id/comments', auth, async (req, res) => {
   res.json(rows)
 })
 
-app.post('/api/posts/:id/comments', auth, async (req, res) => {
+app.post('/api/posts/:id/comments', auth, writeLimiter, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
   const body = typeof req.body?.body === 'string' ? req.body.body.trim() : ''
   if (!body || body.length > 2000) return res.status(400).json({ error: 'Comment must be 1-2,000 characters', field: 'body' })
@@ -1019,7 +2351,7 @@ app.post('/api/posts/:id/comments', auth, async (req, res) => {
   if (!rows[0]) return res.status(404).json({ error: 'Post not found' })
   const comment = await pool.query(
     `SELECT c.id, c.post_id, c.user_id, c.body, c.created_at, c.updated_at,
-      u.name AS author_name, u.role AS author_role,
+      u.name AS author_name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS author_role,
       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url
      FROM comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
     [rows[0].id]
@@ -1029,12 +2361,24 @@ app.post('/api/posts/:id/comments', auth, async (req, res) => {
 
 app.delete('/api/comments/:id', auth, async (req, res) => {
   if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Comment not found' })
-  const { rowCount } = await pool.query('DELETE FROM comments WHERE id = $1 AND user_id = $2', [req.params.id, req.userId])
-  if (!rowCount) return res.status(404).json({ error: 'Comment not found' })
+  const { rows } = await pool.query(
+    `WITH d AS (
+       DELETE FROM comments c USING posts p
+       WHERE c.id = $1 AND p.id = c.post_id AND (c.user_id = $2 OR p.user_id = $2 OR $3)
+       RETURNING c.id, c.post_id, c.user_id
+     ), logged AS (
+       INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       SELECT $2, 'comment.remove', 'comment', d.id::text, jsonb_build_object('postId', d.post_id, 'authorId', d.user_id)
+       FROM d JOIN posts p ON p.id = d.post_id WHERE d.user_id <> $2 AND p.user_id <> $2
+     )
+     SELECT count(*)::int AS n FROM d`,
+    [req.params.id, req.userId, isModerator(req)]
+  )
+  if (!rows[0].n) return res.status(404).json({ error: 'Comment not found' })
   res.status(204).end()
 })
 
-app.post('/api/posts/:id/report', auth, async (req, res) => {
+app.post('/api/posts/:id/report', auth, writeLimiter, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
   const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : ''
   if (reason.length < 5 || reason.length > 1000) return res.status(400).json({ error: 'Report reason must be 5-1,000 characters', field: 'reason' })
@@ -1055,7 +2399,55 @@ app.post('/api/posts/:id/report', auth, async (req, res) => {
   res.status(201).json({ id: rows[0].id, status: 'pending' })
 })
 
-app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), async (req, res) => {
+const analyseLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `analyse:${req.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: 'Too many PDFs analysed. Wait a minute and try again.' }),
+})
+
+app.post('/api/papers/analyze', auth, requireAuthor, analyseLimiter, paperUpload.single('pdf'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a PDF to analyse', field: 'pdf' })
+  if (!isPdf(req.file.buffer)) return res.status(400).json({ error: 'The selected file is not a valid PDF', field: 'pdf' })
+  try {
+    res.json(await analysePdf(req.file.buffer))
+  } catch (err) {
+    if (err.code === 'busy') return res.status(503).json({ error: 'The server is reading other PDFs. Try again in a few seconds.' })
+    log('warn', 'pdf_analysis_failed', { reason: err.code ?? 'error', message: err.message })
+    const message = err.code === 'timeout'
+      ? 'This PDF took too long to read. Fill in the details by hand.'
+      : 'We could not read this PDF. It may be damaged or protected; fill in the details by hand.'
+    res.status(422).json({ error: message })
+  }
+})
+
+const fieldError = (message, field) => Object.assign(new Error(message), { field })
+
+async function resolveAuthors(submitterId, authors) {
+  const [first, ...rest] = authors
+  if (String(first?.user_id) !== String(submitterId)) throw fieldError('You must be the first author of your paper', 'authors')
+  const ids = rest.map((a) => a.user_id)
+  if (ids.some((id) => !id)) throw fieldError('Co-authors must be chosen from your friends on SNARP', 'authors')
+  if (new Set(ids.map(String)).size !== ids.length || ids.some((id) => String(id) === String(submitterId))) {
+    throw fieldError('Each co-author can be added only once', 'authors')
+  }
+  const { rows } = await pool.query(
+    `SELECT u.id, u.name FROM users u
+     WHERE u.id = $1 OR (u.id = ANY($2::int[])
+       AND EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = u.id)
+       AND EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = u.id AND f.followee_id = $1))`,
+    [submitterId, ids]
+  )
+  const names = new Map(rows.map((r) => [String(r.id), r.name]))
+  if (ids.some((id) => !names.has(String(id)))) {
+    throw fieldError('Only friends can be co-authors: people you follow who also follow you back', 'authors')
+  }
+  return authors.map((a) => ({ user_id: Number(a.user_id), name: names.get(String(a.user_id)), affiliation: a.affiliation }))
+}
+
+app.post('/api/papers/submit', auth, requireAuthor, writeLimiter, paperUpload.single('pdf'), async (req, res) => {
   const idempotencyKey = req.get('Idempotency-Key') || null
   if (idempotencyKey && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
     return res.status(400).json({ error: 'Invalid Idempotency-Key' })
@@ -1064,6 +2456,7 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
   let paper
   try {
     paper = validatePaperSubmission(req.body ?? {}, req.file, MAX_PDF_BYTES)
+    paper.authors = await resolveAuthors(req.userId, paper.authors)
   } catch (err) {
     if (err.field) return res.status(400).json({ error: err.message, field: err.field })
     throw err
@@ -1072,8 +2465,8 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
   const inserted = await pool.query(
     `INSERT INTO papers
        (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
-        pdf_content_type, pdf_size, additional_notes, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12)
+        pdf_content_type, pdf_size, additional_notes, idempotency_key, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13)
      ON CONFLICT (user_id, idempotency_key) DO NOTHING
      RETURNING id, title, status, created_at`,
     [
@@ -1089,6 +2482,7 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
       paper.pdfSize,
       paper.additionalNotes,
       idempotencyKey,
+      paper.authors.length > 1 ? 'coauthor_check' : 'pending',
     ]
   )
 
@@ -1104,63 +2498,293 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
   }
   if (!result) throw new Error('Paper submission could not be confirmed')
 
+  if (statusCode === 201 && paper.authors.length > 1) {
+    await pool.query(
+      `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+       SELECT coauthor, $1::int, 'coauthor', 'paper', $4::bigint, $2::text FROM unnest($3::int[]) AS coauthor`,
+      [req.userId, `${paper.authors[0].name} added you as a co-author on "${paper.title.slice(0, 300)}". Check the PDF and approve it.`, paper.authors.slice(1).map((a) => a.user_id), result.id]
+    ).catch((err) => log('error', 'coauthor_notify_failed', { paperId: result.id, code: err.code }))
+  }
+
   res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
 })
 
-app.get('/api/papers/my-submissions', auth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
-      status, rejection_reason, reviewed_at, created_at
-    FROM papers WHERE user_id = $1 ORDER BY created_at DESC`, [req.userId])
-  res.json(rows)
-})
+const likePattern = (q) => `%${q.replace(/[\\%_]/g, '\\$&')}%`
+const pageParams = (query, { max = 50, fallback = 20 } = {}) => {
+  const page = Math.max(1, Math.min(10000, Number.parseInt(query.page, 10) || 1))
+  const limit = Math.max(1, Math.min(max, Number.parseInt(query.limit, 10) || fallback))
+  return { page, limit, offset: (page - 1) * limit }
+}
+const cleanText = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max + 1) : '')
+const avatarUrl = (imageId) => (imageId ? `/api/images/${imageId}` : null)
 
-app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
-  const status = String(req.query.status ?? 'pending')
-  if (!['pending', 'approved', 'rejected', 'reviewed'].includes(status)) {
-    return res.status(400).json({ error: 'Status must be pending, approved, rejected, or reviewed' })
+async function inTransaction(work) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await work(client)
+    await client.query(result?.rollback ? 'ROLLBACK' : 'COMMIT')
+    return result
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
   }
-  const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
-  const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20))
-  const where = status === 'reviewed' ? "p.status IN ('approved', 'rejected')" : 'p.status = $1'
-  const params = status === 'reviewed' ? [limit, (page - 1) * limit] : [status, limit, (page - 1) * limit]
-  const limitParam = status === 'reviewed' ? '$1' : '$2'
-  const offsetParam = status === 'reviewed' ? '$2' : '$3'
-  const countParams = status === 'reviewed' ? [] : [status]
-  const countWhere = status === 'reviewed' ? "status IN ('approved', 'rejected')" : 'status = $1'
-  const [{ rows }, countResult] = await Promise.all([
-    pool.query(`SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.status,
-      p.created_at, p.reviewed_at, p.rejection_reason, submitter.name AS submitter_name,
-      submitter.email AS submitter_email, reviewer.name AS reviewer_name
-      FROM papers p JOIN users submitter ON submitter.id = p.user_id
-      LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by
-      WHERE ${where} ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC
-      LIMIT ${limitParam} OFFSET ${offsetParam}`, params),
-    pool.query(`SELECT count(*)::int AS total FROM papers WHERE ${countWhere}`, countParams),
+}
+const fail = (problem) => ({ rollback: true, problem })
+const sendProblem = (res, problem) => res.status(problem.status).json({ error: problem.error, ...(problem.field && { field: problem.field }), ...(problem.code && { code: problem.code }) })
+
+const audit = (db, actorId, action, targetType, targetId, details = {}) => db.query(
+  'INSERT INTO audit_logs (actor_id, action, target_type, target_id, details) VALUES ($1, $2, $3, $4::text, $5::jsonb)',
+  [actorId, action, targetType, String(targetId), JSON.stringify(details)]
+)
+
+const notifyPaperAuthors = (db, paper, text, { includeCoauthors = true } = {}) => db.query(
+  `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+   SELECT DISTINCT recipient, NULL::int, 'paper_review', 'paper', $1::bigint, $2::text
+   FROM (SELECT $3::int AS recipient
+     UNION SELECT (a->>'user_id')::int FROM jsonb_array_elements($4::jsonb) AS a WHERE $5::boolean AND a ? 'user_id') r
+   WHERE recipient IS NOT NULL`,
+  [paper.id, text.slice(0, 500), paper.user_id, JSON.stringify(paper.authors ?? []), includeCoauthors]
+)
+
+const PAPER_LIST_COLUMNS = `p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.status, p.user_id,
+  p.created_at, p.updated_at, p.reviewed_at, p.published_at, p.review_started_at, p.rejection_reason, p.round, p.resubmitted_at,
+  p.reviewed_by, p.assigned_to, submitter.name AS submitter_name, reviewer.name AS reviewer_name, assignee.name AS assignee_name,
+  (SELECT count(*)::int FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round) AS review_count,
+  (SELECT round(avg(r.overall_rating), 1)::float FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round) AS avg_rating`
+const PAPER_LIST_FROM = `FROM papers p JOIN users submitter ON submitter.id = p.user_id
+  LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by LEFT JOIN users assignee ON assignee.id = p.assigned_to`
+const NOT_OWN_PAPER = (param) => `p.user_id <> ${param} AND NOT p.authors @> jsonb_build_array(jsonb_build_object('user_id', ${param}::int))`
+const MODERATOR_VIEWS = ['queue', 'pending', 'under_review', 'mine', 'reviewed_by_me']
+const ADMIN_VIEWS = ['all', ...PAPER_STATUSES, ...MODERATOR_VIEWS]
+
+async function listPapers(req, { admin }) {
+  const view = String(req.query.status ?? (admin ? 'all' : 'queue'))
+  if (!(admin ? ADMIN_VIEWS : MODERATOR_VIEWS).includes(view)) {
+    return { problem: { status: 400, error: `Status must be one of: ${(admin ? ADMIN_VIEWS : MODERATOR_VIEWS).join(', ')}` } }
+  }
+  const { page, limit, offset } = pageParams(req.query)
+  const values = [req.userId]
+  const conditions = []
+  if (view === 'queue') conditions.push("p.status IN ('pending', 'under_review')")
+  else if (view === 'mine') conditions.push("p.status = 'under_review' AND p.assigned_to = $1")
+  else if (view === 'reviewed_by_me') {
+    conditions.push("EXISTS (SELECT 1 FROM paper_reviews pr WHERE pr.paper_id = p.id AND pr.reviewer_id = $1 AND pr.decision IN ('approved', 'rejected', 'revision_requested'))")
+  } else if (view !== 'all') {
+    values.push(view)
+    conditions.push(`p.status = $${values.length}`)
+  }
+  if (!admin && view !== 'reviewed_by_me') conditions.push(NOT_OWN_PAPER('$1'))
+  const q = cleanText(req.query.q, 100)
+  if (q) {
+    values.push(likePattern(q))
+    conditions.push(`(p.title ILIKE $${values.length} OR p.domain ILIKE $${values.length} OR submitter.name ILIKE $${values.length} OR array_to_string(p.tags, ' ') ILIKE $${values.length})`)
+  }
+  const domain = cleanText(req.query.domain, 120)
+  if (domain) {
+    values.push(domain)
+    conditions.push(`lower(p.domain) = lower($${values.length})`)
+  }
+  const where = conditions.length ? conditions.join(' AND ') : 'TRUE'
+  const usesActor = where.includes('$1')
+  const params = usesActor ? values : values.slice(1)
+  const sql = usesActor ? where : where.replace(/\$(\d+)/g, (_m, n) => `$${Number(n) - 1}`)
+  const order = ['queue', 'pending', 'under_review', 'mine'].includes(view)
+    ? 'COALESCE(p.resubmitted_at, p.created_at) ASC, p.id ASC'
+    : 'COALESCE(p.published_at, p.reviewed_at, p.resubmitted_at, p.created_at) DESC, p.id DESC'
+  const [{ rows }, count] = await Promise.all([
+    pool.query(`SELECT ${PAPER_LIST_COLUMNS} ${PAPER_LIST_FROM} WHERE ${sql} ORDER BY ${order}
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]),
+    pool.query(`SELECT count(*)::int AS total ${PAPER_LIST_FROM} WHERE ${sql}`, params),
   ])
-  res.json({ papers: rows, page, limit, total: countResult.rows[0].total })
-})
+  return { papers: rows, page, limit, total: count.rows[0].total, view }
+}
+
+async function loadModerationPaper(id, req) {
+  const admin = isSuperAdmin(req)
+  const { rows } = await pool.query(`
+    SELECT p.id, p.user_id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.pdf_filename, p.pdf_size,
+      p.additional_notes, p.status, p.rejection_reason, p.revision_note, p.round, p.draft, p.created_at, p.updated_at,
+      p.resubmitted_at, p.reviewed_at, p.reviewed_by, p.review_started_at, p.assigned_to, p.published_at,
+      submitter.name AS submitter_name, submitter.email AS submitter_email, reviewer.name AS reviewer_name,
+      assignee.name AS assignee_name, publisher.name AS publisher_name
+    FROM papers p JOIN users submitter ON submitter.id = p.user_id
+    LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by
+    LEFT JOIN users assignee ON assignee.id = p.assigned_to
+    LEFT JOIN users publisher ON publisher.id = p.published_by
+    WHERE p.id = $1`, [id])
+  const paper = rows[0]
+  if (!paper) return null
+  const [{ rows: history }, { rows: notes }, { rows: reviews }] = await Promise.all([
+    pool.query(`SELECT pr.id, pr.decision, pr.comment, pr.round, pr.created_at, pr.reviewer_id AS actor_id,
+        u.name AS actor_name, u.role AS actor_role
+      FROM paper_reviews pr LEFT JOIN users u ON u.id = pr.reviewer_id
+      WHERE pr.paper_id = $1 ORDER BY pr.created_at DESC, pr.id DESC`, [id]),
+    pool.query(`SELECT n.id, n.body, n.created_at, n.author_id, u.name AS author_name
+      FROM paper_notes n LEFT JOIN users u ON u.id = n.author_id
+      WHERE n.paper_id = $1 ORDER BY n.created_at, n.id`, [id]),
+    pool.query(`${REVIEW_SELECT} WHERE r.paper_id = $1 AND r.round = $2 ORDER BY r.created_at, r.id`, [id, paper.round]),
+  ])
+  const own = String(paper.user_id) === String(req.userId) || (paper.authors ?? []).some((a) => String(a.user_id) === String(req.userId))
+  const allowed = (action) => !moderationProblem({ paper, actorId: req.userId, actorRole: req.userRole, action })
+  return {
+    ...paper,
+    submitter_email: admin ? paper.submitter_email : undefined,
+    is_own: own,
+    history,
+    notes,
+    peer_reviews: reviews,
+    peer_summary: roundSummary(reviews),
+    actions: {
+      start_review: allowed('start_review'),
+      release: allowed('release'),
+      approve: allowed('approve'),
+      reject: allowed('reject'),
+      request_revision: allowed('request_revision'),
+      override: admin,
+      note: !own,
+    },
+  }
+}
+
+const MODERATION_ACTIONS = {
+  start_review: { decision: 'under_review', audit: 'paper.review_started', textField: null },
+  release: { decision: 'released', audit: 'paper.review_released', textField: null },
+  approve: { decision: 'approved', audit: 'paper.approved', textField: 'comment', min: 0, max: 2000 },
+  reject: { decision: 'rejected', audit: 'paper.rejected', textField: 'reason', min: 5, max: 2000, label: 'Rejection reason' },
+  request_revision: { decision: 'revision_requested', audit: 'paper.revision_requested', textField: 'note', min: 10, max: 5000, label: 'Requested changes' },
+}
+
+async function moderatePaper(req, res, action) {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const rule = MODERATION_ACTIONS[action]
+  const text = rule.textField ? cleanText(req.body?.[rule.textField], rule.max) : ''
+  if (rule.textField && (text.length < rule.min || text.length > rule.max)) {
+    return res.status(400).json({
+      error: rule.min ? `${rule.label} must be ${rule.min} to ${rule.max.toLocaleString('en-US')} characters` : `Comment must be at most ${rule.max.toLocaleString('en-US')} characters`,
+      field: rule.textField,
+    })
+  }
+  const result = await inTransaction(async (db) => {
+    const { rows } = await db.query('SELECT id, user_id, title, status, round, authors, assigned_to FROM papers WHERE id = $1 FOR UPDATE', [req.params.id])
+    const paper = rows[0]
+    const problem = moderationProblem({ paper, actorId: req.userId, actorRole: req.userRole, action })
+    if (problem) return fail(problem)
+    const to = nextStatus(paper.status, action)
+    const updates = {
+      start_review: ['assigned_to = $2, review_started_at = now()', [paper.id, req.userId]],
+      release: ['assigned_to = NULL, review_started_at = NULL', [paper.id]],
+      approve: ['reviewed_by = $2, reviewed_at = now(), rejection_reason = NULL', [paper.id, req.userId]],
+      reject: ['reviewed_by = $2, reviewed_at = now(), rejection_reason = $3', [paper.id, req.userId, text]],
+      request_revision: ['reviewed_by = $2, reviewed_at = now(), revision_note = $3', [paper.id, req.userId, text]],
+    }
+    const [set, values] = updates[action]
+    await db.query(`UPDATE papers SET status = '${to}', ${set}, updated_at = now() WHERE id = $1`, values)
+    await db.query(
+      'INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, $3, $4, $5)',
+      [paper.id, req.userId, rule.decision, text, paper.round]
+    )
+    await audit(db, req.userId, rule.audit, 'paper', paper.id, {
+      from: paper.status, to, round: paper.round, ...(text && { [rule.textField]: text.slice(0, 500) }),
+    })
+    const title = paper.title.slice(0, 200)
+    if (action === 'start_review') await notifyPaperAuthors(db, paper, `A moderator started verifying "${title}"`, { includeCoauthors: false })
+    if (action === 'approve') await notifyPaperAuthors(db, paper, `"${title}" was approved by a moderator. The main author can now publish it from My submissions.`)
+    if (action === 'reject') await notifyPaperAuthors(db, paper, `"${title}" was rejected by a moderator: ${text.slice(0, 200)}`)
+    if (action === 'request_revision') await notifyPaperAuthors(db, paper, `Changes requested on your paper "${title}"`)
+    return { paper }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  res.json(await loadModerationPaper(result.paper.id, req))
+}
+
+async function moderatorActivity(userId) {
+  const [{ rows: counts }, { rows: recent }] = await Promise.all([
+    pool.query(`SELECT
+        count(*) FILTER (WHERE decision = 'approved')::int AS approved,
+        count(*) FILTER (WHERE decision = 'rejected')::int AS rejected,
+        count(*) FILTER (WHERE decision = 'revision_requested')::int AS revision_requested,
+        count(*) FILTER (WHERE decision = 'under_review')::int AS reviews_started,
+        count(*) FILTER (WHERE decision IN ('approved', 'rejected', 'revision_requested') AND created_at > now() - interval '30 days')::int AS decisions_30d,
+        max(created_at) AS last_action_at,
+        (SELECT count(*)::int FROM papers WHERE assigned_to = $1 AND status = 'under_review') AS in_progress
+      FROM paper_reviews WHERE reviewer_id = $1
+        AND decision IN ('approved', 'rejected', 'revision_requested', 'under_review', 'released')`, [userId]),
+    pool.query(`SELECT pr.id, pr.decision, pr.comment, pr.round, pr.created_at, p.id AS paper_id, p.title, p.status, p.domain
+      FROM paper_reviews pr JOIN papers p ON p.id = pr.paper_id
+      WHERE pr.reviewer_id = $1 AND pr.decision IN ('approved', 'rejected', 'revision_requested', 'under_review', 'released')
+      ORDER BY pr.created_at DESC, pr.id DESC LIMIT 30`, [userId]),
+  ])
+  return { ...counts[0], recent }
+}
 
 app.get('/api/moderation/summary', auth, requireModerator, async (req, res) => {
   const { rows } = await pool.query(`
     SELECT
-      (SELECT count(*)::int FROM users) AS users,
-      (SELECT count(*)::int FROM papers WHERE status = 'pending') AS pending_papers,
-      (SELECT count(*)::int FROM papers WHERE status IN ('approved', 'rejected')) AS reviewed_papers,
-      (SELECT count(*)::int FROM reports WHERE status = 'pending') AS pending_reports,
-      (SELECT count(*)::int FROM reports) AS total_reports`)
-  const summary = rows[0]
-  if (req.userRole !== 'admin') delete summary.users
-  res.json(summary)
+      count(*) FILTER (WHERE status = 'pending' AND ${NOT_OWN_PAPER('$1')})::int AS pending,
+      count(*) FILTER (WHERE status = 'under_review')::int AS under_review,
+      count(*) FILTER (WHERE status = 'under_review' AND assigned_to = $1)::int AS mine,
+      count(*) FILTER (WHERE status = 'revision_requested')::int AS revision_requested,
+      count(*) FILTER (WHERE status = 'approved')::int AS approved,
+      (SELECT count(*)::int FROM paper_reviews WHERE reviewer_id = $1 AND decision IN ('approved', 'rejected', 'revision_requested')) AS my_decisions
+    FROM papers p`, [req.userId])
+  res.json(rows[0])
 })
 
-app.get('/api/moderation/reports', auth, requireModerator, async (req, res) => {
+app.get('/api/moderation/activity', auth, requireModerator, async (req, res) => {
+  res.json(await moderatorActivity(req.userId))
+})
+
+app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
+  const result = await listPapers(req, { admin: false })
+  if (result.problem) return sendProblem(res, result.problem)
+  res.json(result)
+})
+
+app.get('/api/moderation/papers/:id', auth, requireModerator, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const paper = await loadModerationPaper(req.params.id, req)
+  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+  res.json(paper)
+})
+
+app.patch('/api/moderation/papers/:id/start-review', auth, requireModerator, writeLimiter, (req, res) => moderatePaper(req, res, 'start_review'))
+app.patch('/api/moderation/papers/:id/release', auth, requireModerator, writeLimiter, (req, res) => moderatePaper(req, res, 'release'))
+app.patch('/api/moderation/papers/:id/approve', auth, requireModerator, writeLimiter, (req, res) => moderatePaper(req, res, 'approve'))
+app.patch('/api/moderation/papers/:id/reject', auth, requireModerator, writeLimiter, (req, res) => moderatePaper(req, res, 'reject'))
+app.patch('/api/moderation/papers/:id/request-revision', auth, requireModerator, writeLimiter, (req, res) => moderatePaper(req, res, 'request_revision'))
+
+app.post('/api/moderation/papers/:id/notes', auth, requireModerator, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const body = cleanText(req.body?.body, 2000)
+  if (!body || body.length > 2000) return res.status(400).json({ error: 'Note must be 1 to 2,000 characters', field: 'body' })
+  const result = await inTransaction(async (db) => {
+    const { rows } = await db.query('SELECT id, user_id, authors FROM papers WHERE id = $1', [req.params.id])
+    const paper = rows[0]
+    if (!paper) return fail({ status: 404, error: 'Paper not found' })
+    if (String(paper.user_id) === String(req.userId) || (paper.authors ?? []).some((a) => String(a.user_id) === String(req.userId))) {
+      return fail({ status: 403, error: 'You cannot add review notes to your own paper' })
+    }
+    const { rows: inserted } = await db.query(
+      'INSERT INTO paper_notes (paper_id, author_id, body) VALUES ($1, $2, $3) RETURNING id, body, created_at, author_id',
+      [paper.id, req.userId, body]
+    )
+    await audit(db, req.userId, 'paper.note_added', 'paper', paper.id, { noteId: inserted[0].id })
+    return { note: inserted[0] }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  const { rows } = await pool.query('SELECT name FROM users WHERE id = $1', [req.userId])
+  res.status(201).json({ ...result.note, author_name: rows[0]?.name ?? null })
+})
+
+app.get('/api/moderation/reports', auth, requirePermission('reports.manage', 'Super Admin access required'), async (req, res) => {
   const status = String(req.query.status ?? 'pending')
   if (!['pending', 'reviewed', 'dismissed'].includes(status)) {
     return res.status(400).json({ error: 'Status must be pending, reviewed, or dismissed' })
   }
-  const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
-  const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20))
+  const { page, limit, offset } = pageParams(req.query)
   const [{ rows }, countResult] = await Promise.all([
     pool.query(`SELECT r.id, r.post_id, r.reported_by, r.reason, r.status, r.created_at,
         reporter.name AS reporter_name, post.user_id AS post_author_id,
@@ -1169,13 +2793,13 @@ app.get('/api/moderation/reports', auth, requireModerator, async (req, res) => {
       JOIN users reporter ON reporter.id = r.reported_by
       JOIN users author ON author.id = post.user_id
       WHERE r.status = $1 ORDER BY r.created_at DESC, r.id DESC LIMIT $2 OFFSET $3`,
-    [status, limit, (page - 1) * limit]),
+    [status, limit, offset]),
     pool.query('SELECT count(*)::int AS total FROM reports WHERE status = $1', [status]),
   ])
   res.json({ reports: rows, page, limit, total: countResult.rows[0].total })
 })
 
-app.patch('/api/moderation/reports/:id/:decision', auth, requireModerator, async (req, res) => {
+app.patch('/api/moderation/reports/:id/:decision', auth, requirePermission('reports.manage', 'Super Admin access required'), async (req, res) => {
   if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Report not found' })
   const decision = req.params.decision
   if (!['reviewed', 'dismissed'].includes(decision)) return res.status(400).json({ error: 'Decision must be reviewed or dismissed' })
@@ -1197,105 +2821,305 @@ app.patch('/api/moderation/reports/:id/:decision', auth, requireModerator, async
   res.json(rows[0])
 })
 
-app.get('/api/admin/audit-logs', auth, requireAdmin, async (req, res) => {
-  const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
-  const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 50))
-  const [{ rows }, countResult] = await Promise.all([
+app.get('/api/admin/overview', auth, requireAdmin, async (_req, res) => {
+  const [{ rows: totals }, { rows: daily }, { rows: recent }] = await Promise.all([
+    pool.query(`SELECT
+        (SELECT count(*)::int FROM users) AS users_total,
+        (SELECT count(*)::int FROM users WHERE blocked_at IS NULL AND email_verified_at IS NOT NULL
+          AND (last_login_at > now() - interval '30 days' OR EXISTS (
+            SELECT 1 FROM auth_sessions s WHERE s.user_id = users.id AND s.revoked_at IS NULL AND s.expires_at > now() AND s.last_seen_at > now() - interval '30 days'))) AS users_active,
+        (SELECT count(*)::int FROM users WHERE blocked_at IS NOT NULL) AS users_blocked,
+        (SELECT count(*)::int FROM users WHERE email_verified_at IS NULL) AS users_unverified,
+        (SELECT count(*)::int FROM users WHERE role = 'moderator') AS moderators_total,
+        (SELECT count(*)::int FROM users WHERE role = 'moderator' AND blocked_at IS NOT NULL) AS moderators_suspended,
+        (SELECT count(*)::int FROM papers) AS papers_total,
+        (SELECT count(*)::int FROM papers WHERE status = 'coauthor_check') AS papers_coauthor_check,
+        (SELECT count(*)::int FROM papers WHERE status = 'pending') AS papers_pending,
+        (SELECT count(*)::int FROM papers WHERE status = 'under_review') AS papers_under_review,
+        (SELECT count(*)::int FROM papers WHERE status = 'revision_requested') AS papers_revision_requested,
+        (SELECT count(*)::int FROM papers WHERE status = 'approved') AS papers_approved,
+        (SELECT count(*)::int FROM papers WHERE status = 'rejected') AS papers_rejected,
+        (SELECT count(*)::int FROM papers WHERE status = 'published') AS papers_published,
+        (SELECT count(*)::int FROM reports WHERE status = 'pending') AS reports_pending`),
+    pool.query(`SELECT d::date AS day,
+        (SELECT count(*)::int FROM papers WHERE created_at >= d AND created_at < d + interval '1 day') AS submitted,
+        (SELECT count(*)::int FROM users WHERE created_at >= d AND created_at < d + interval '1 day') AS signups
+      FROM generate_series(date_trunc('day', now()) - interval '13 days', date_trunc('day', now()), interval '1 day') AS d
+      ORDER BY d`),
+    pool.query(`SELECT a.id, a.action, a.target_type, a.target_id, a.created_at, a.actor_id, u.name AS actor_name,
+        COALESCE(a.actor_role, u.role) AS actor_role
+      FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id ORDER BY a.created_at DESC, a.id DESC LIMIT 8`),
+  ])
+  res.json({ ...totals[0], daily, recent })
+})
+
+const ADMIN_USER_STATUSES = ['active', 'blocked', 'unverified']
+app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
+  const role = String(req.query.role ?? '')
+  const status = String(req.query.status ?? '')
+  if (role && !['admin', 'moderator', 'author', 'user'].includes(role)) return res.status(400).json({ error: 'Unknown role', field: 'role' })
+  if (status && !ADMIN_USER_STATUSES.includes(status)) return res.status(400).json({ error: 'Unknown status', field: 'status' })
+  const { page, limit, offset } = pageParams(req.query)
+  const values = []
+  const conditions = []
+  const q = cleanText(req.query.q, 100)
+  if (q) {
+    values.push(likePattern(q))
+    conditions.push(`(u.name ILIKE $${values.length} OR u.email ILIKE $${values.length})`)
+  }
+  if (role) {
+    values.push(role)
+    conditions.push(`u.role = $${values.length}`)
+  }
+  if (status === 'blocked') conditions.push('u.blocked_at IS NOT NULL')
+  if (status === 'active') conditions.push('u.blocked_at IS NULL AND u.email_verified_at IS NOT NULL')
+  if (status === 'unverified') conditions.push('u.email_verified_at IS NULL')
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+  const [{ rows }, count] = await Promise.all([
+    pool.query(`SELECT u.id, u.name, u.email, u.role, u.created_at, u.last_login_at, u.blocked_at, u.blocked_reason,
+        u.email_verified_at IS NOT NULL AS email_verified, u.profile_image_id,
+        (SELECT count(*)::int FROM papers p WHERE p.user_id = u.id) AS paper_count,
+        (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count
+      FROM users u ${where}
+      ORDER BY CASE u.role WHEN 'admin' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END, u.created_at DESC, u.id DESC
+      LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]),
+    pool.query(`SELECT count(*)::int AS total FROM users u ${where}`, values),
+  ])
+  res.json({
+    users: rows.map(({ profile_image_id, ...user }) => ({ ...user, avatar_url: avatarUrl(profile_image_id) })),
+    page, limit, total: count.rows[0].total,
+  })
+})
+
+app.get('/api/admin/users/:id', auth, requireAdmin, async (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
+  const { rows } = await pool.query(`
+    SELECT u.id, u.name, u.email, u.role, u.created_at, u.last_login_at, u.blocked_at, u.blocked_reason,
+      u.email_verified_at, u.profile_image_id, blocker.name AS blocked_by_name,
+      COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department,
+      COALESCE(up.research_interests, '{}') AS research_interests, COALESCE(up.bio, '') AS bio,
+      (SELECT count(*)::int FROM posts WHERE user_id = u.id) AS post_count,
+      (SELECT count(*)::int FROM follows WHERE followee_id = u.id) AS follower_count,
+      (SELECT count(*)::int FROM auth_sessions s WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > now()) AS active_sessions,
+      (SELECT max(s.last_seen_at) FROM auth_sessions s WHERE s.user_id = u.id) AS last_seen_at
+    FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id LEFT JOIN users blocker ON blocker.id = u.blocked_by
+    WHERE u.id = $1`, [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'User not found' })
+  const [{ rows: papers }, { rows: activity }, moderation] = await Promise.all([
+    pool.query(`SELECT p.id, p.title, p.domain, p.status, p.round, p.created_at, p.reviewed_at, p.published_at,
+        p.user_id <> $1 AS coauthored, reviewer.name AS reviewer_name
+      FROM papers p LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by
+      WHERE p.user_id = $1 OR p.authors @> jsonb_build_array(jsonb_build_object('user_id', $1::int))
+      ORDER BY p.created_at DESC LIMIT 50`, [req.params.id]),
     pool.query(`SELECT a.id, a.action, a.target_type, a.target_id, a.details, a.created_at,
-        u.name AS actor_name, u.role AS actor_role
+        COALESCE(a.actor_role, u.role) AS actor_role, u.name AS actor_name, a.actor_id
       FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
-      ORDER BY a.created_at DESC, a.id DESC LIMIT $1 OFFSET $2`, [limit, (page - 1) * limit]),
-    pool.query('SELECT count(*)::int AS total FROM audit_logs'),
+      WHERE a.actor_id = $1 OR (a.target_type = 'user' AND a.target_id = $1::text)
+      ORDER BY a.created_at DESC, a.id DESC LIMIT 30`, [req.params.id]),
+    rows[0].role === 'moderator' ? moderatorActivity(req.params.id) : null,
+  ])
+  const { profile_image_id, ...user } = rows[0]
+  res.json({ ...user, avatar_url: avatarUrl(profile_image_id), papers, activity, moderation })
+})
+
+async function releaseAssignedPapers(db, moderatorId, actorId, reason) {
+  const { rows } = await db.query(
+    `UPDATE papers SET status = 'pending', assigned_to = NULL, review_started_at = NULL, updated_at = now()
+     WHERE assigned_to = $1 AND status = 'under_review' RETURNING id, round`, [moderatorId]
+  )
+  for (const paper of rows) {
+    await db.query(
+      "INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, 'released', $3, $4)",
+      [paper.id, actorId, reason, paper.round]
+    )
+  }
+  return rows.length
+}
+
+async function setBlocked(req, res, blocking) {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
+  const reason = cleanText(req.body?.reason, 500)
+  if (blocking && (reason.length < 5 || reason.length > 500)) return res.status(400).json({ error: 'Give a reason of 5 to 500 characters', field: 'reason' })
+  const result = await inTransaction(async (db) => {
+    const { rows } = await db.query('SELECT id, name, role, blocked_at FROM users WHERE id = $1 FOR UPDATE', [req.params.id])
+    const target = rows[0]
+    const problem = blockProblem({ actorId: req.userId, actorRole: req.userRole, target, blocking })
+    if (problem) return fail(problem)
+    let released = 0
+    if (blocking) {
+      await db.query('UPDATE users SET blocked_at = now(), blocked_reason = $2, blocked_by = $3 WHERE id = $1', [target.id, reason, req.userId])
+      await db.query('UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [target.id])
+      if (target.role === 'moderator') released = await releaseAssignedPapers(db, target.id, req.userId, 'Moderator was suspended')
+    } else {
+      await db.query('UPDATE users SET blocked_at = NULL, blocked_reason = NULL, blocked_by = NULL WHERE id = $1', [target.id])
+    }
+    const action = target.role === 'moderator'
+      ? (blocking ? 'moderator.suspended' : 'moderator.reactivated')
+      : (blocking ? 'user.blocked' : 'user.unblocked')
+    await audit(db, req.userId, action, 'user', target.id, { role: target.role, ...(blocking && { reason, releasedPapers: released }) })
+    return { id: target.id }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  const { rows } = await pool.query('SELECT id, name, role, blocked_at, blocked_reason FROM users WHERE id = $1', [result.id])
+  res.json(rows[0])
+}
+
+app.patch('/api/admin/users/:id/block', auth, requireAdmin, writeLimiter, (req, res) => setBlocked(req, res, true))
+app.patch('/api/admin/users/:id/unblock', auth, requireAdmin, writeLimiter, (req, res) => setBlocked(req, res, false))
+
+async function changeRole(req, res, findTarget, nextRole) {
+  const result = await inTransaction(async (db) => {
+    const target = await findTarget(db)
+    const problem = roleChangeProblem({ actorId: req.userId, actorRole: req.userRole, target, nextRole })
+    if (problem) return fail(problem)
+    await db.query('UPDATE users SET role = $2 WHERE id = $1', [target.id, nextRole])
+    let released = 0
+    if (target.role === 'moderator') released = await releaseAssignedPapers(db, target.id, req.userId, 'Moderator role was removed')
+    const action = nextRole === 'moderator' ? 'moderator.added' : target.role === 'moderator' ? 'moderator.removed' : 'user.role_changed'
+    await audit(db, req.userId, action, 'user', target.id, { from: target.role, to: nextRole, releasedPapers: released })
+    return { id: target.id }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  const { rows } = await pool.query('SELECT id, name, email, role, blocked_at FROM users WHERE id = $1', [result.id])
+  res.json(rows[0])
+}
+
+const lockUser = (column, value) => async (db) => (await db.query(
+  `SELECT id, name, email, role, blocked_at, email_verified_at FROM users WHERE ${column} = $1 FOR UPDATE`, [value]
+)).rows[0]
+
+app.put('/api/admin/users/:id/role', auth, requireAdmin, writeLimiter, (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
+  return changeRole(req, res, lockUser('id', req.params.id), String(req.body?.role ?? ''))
+})
+
+app.post('/api/admin/moderators', auth, requireAdmin, writeLimiter, (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  if (emailProblem(email)) return res.status(400).json({ error: 'Enter a valid email address', field: 'email' })
+  return changeRole(req, res, lockUser('email', email), 'moderator')
+})
+
+app.get('/api/admin/moderators', auth, requireAdmin, async (req, res) => {
+  const status = String(req.query.status ?? '')
+  if (status && !['active', 'suspended'].includes(status)) return res.status(400).json({ error: 'Status must be active or suspended', field: 'status' })
+  const values = []
+  const conditions = ["u.role = 'moderator'"]
+  const q = cleanText(req.query.q, 100)
+  if (q) {
+    values.push(likePattern(q))
+    conditions.push(`(u.name ILIKE $${values.length} OR u.email ILIKE $${values.length})`)
+  }
+  if (status === 'active') conditions.push('u.blocked_at IS NULL')
+  if (status === 'suspended') conditions.push('u.blocked_at IS NOT NULL')
+  const { rows } = await pool.query(`
+    SELECT u.id, u.name, u.email, u.created_at, u.last_login_at, u.blocked_at, u.blocked_reason, u.profile_image_id,
+      count(pr.id) FILTER (WHERE pr.decision = 'approved')::int AS approved,
+      count(pr.id) FILTER (WHERE pr.decision = 'rejected')::int AS rejected,
+      count(pr.id) FILTER (WHERE pr.decision = 'revision_requested')::int AS revision_requested,
+      max(pr.created_at) AS last_action_at,
+      (SELECT count(*)::int FROM papers p WHERE p.assigned_to = u.id AND p.status = 'under_review') AS in_progress,
+      (SELECT a.created_at FROM audit_logs a WHERE a.action = 'moderator.added' AND a.target_type = 'user' AND a.target_id = u.id::text
+        ORDER BY a.created_at DESC LIMIT 1) AS moderator_since
+    FROM users u LEFT JOIN paper_reviews pr ON pr.reviewer_id = u.id
+      AND pr.decision IN ('approved', 'rejected', 'revision_requested')
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY u.id ORDER BY u.blocked_at IS NOT NULL, u.name LIMIT 200`, values)
+  res.json(rows.map(({ profile_image_id, ...moderator }) => ({ ...moderator, avatar_url: avatarUrl(profile_image_id) })))
+})
+
+app.get('/api/admin/moderators/:id/activity', auth, requireAdmin, async (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Moderator not found' })
+  const { rows } = await pool.query('SELECT id, name, role FROM users WHERE id = $1', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Moderator not found' })
+  res.json({ ...rows[0], ...(await moderatorActivity(rows[0].id)) })
+})
+
+app.get('/api/admin/papers', auth, requireAdmin, async (req, res) => {
+  const result = await listPapers(req, { admin: true })
+  if (result.problem) return sendProblem(res, result.problem)
+  res.json(result)
+})
+
+app.patch('/api/admin/papers/:id/status', auth, requireAdmin, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const status = String(req.body?.status ?? '')
+  const reason = cleanText(req.body?.reason, 2000)
+  const result = await inTransaction(async (db) => {
+    const { rows } = await db.query('SELECT id, user_id, title, status, round, authors FROM papers WHERE id = $1 FOR UPDATE', [req.params.id])
+    const paper = rows[0]
+    const problem = overrideProblem({ paper, actorRole: req.userRole, status, reason })
+    if (problem) return fail(problem)
+    const updates = {
+      pending: 'assigned_to = NULL, review_started_at = NULL, published_at = NULL, published_by = NULL',
+      under_review: 'assigned_to = $2, review_started_at = now(), published_at = NULL, published_by = NULL',
+      revision_requested: 'reviewed_by = $2, reviewed_at = now(), revision_note = $3, published_at = NULL, published_by = NULL',
+      approved: 'reviewed_by = $2, reviewed_at = now(), rejection_reason = NULL, published_at = NULL, published_by = NULL',
+      rejected: 'reviewed_by = $2, reviewed_at = now(), rejection_reason = $3, published_at = NULL, published_by = NULL',
+      published: 'published_at = now(), published_by = $2, rejection_reason = NULL',
+    }
+    await db.query(
+      `UPDATE papers SET status = $4, ${updates[status]}, updated_at = now() WHERE id = $1 AND $2::int IS NOT NULL AND $3::text IS NOT NULL`,
+      [paper.id, req.userId, reason, status]
+    )
+    await db.query(
+      "INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, 'status_changed', $3, $4)",
+      [paper.id, req.userId, `Status changed from ${paper.status.replace('_', ' ')} to ${status.replace('_', ' ')}. ${reason}`, paper.round]
+    )
+    await audit(db, req.userId, status === 'published' ? 'paper.published' : 'paper.status_changed', 'paper', paper.id, { from: paper.status, to: status, reason: reason.slice(0, 500), override: true })
+    const label = { pending: 'moved back to the review queue', under_review: 'is under review', revision_requested: 'needs changes', approved: 'was approved', rejected: 'was rejected', published: 'was published' }[status]
+    await notifyPaperAuthors(db, paper, `An administrator updated "${paper.title.slice(0, 200)}": it ${label}. ${reason.slice(0, 200)}`)
+    return { id: paper.id }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  res.json(await loadModerationPaper(result.id, req))
+})
+
+app.get('/api/admin/audit-logs', auth, requirePermission('audit.read', 'Super Admin access required'), async (req, res) => {
+  const { page, limit, offset } = pageParams(req.query, { max: 100, fallback: 50 })
+  const values = []
+  const conditions = []
+  const action = cleanText(req.query.action, 80)
+  if (action) {
+    values.push(`${action.replace(/[\\%_]/g, '\\$&')}%`)
+    conditions.push(`a.action LIKE $${values.length}`)
+  }
+  const q = cleanText(req.query.q, 100)
+  if (q) {
+    values.push(likePattern(q))
+    conditions.push(`(u.name ILIKE $${values.length} OR a.action ILIKE $${values.length} OR a.target_id ILIKE $${values.length})`)
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+  const [{ rows }, countResult] = await Promise.all([
+    pool.query(`SELECT a.id, a.action, a.target_type, a.target_id, a.details, a.created_at, a.actor_id,
+        u.name AS actor_name, COALESCE(a.actor_role, u.role) AS actor_role
+      FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id ${where}
+      ORDER BY a.created_at DESC, a.id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]),
+    pool.query(`SELECT count(*)::int AS total FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id ${where}`, values),
   ])
   res.json({ items: rows, page, limit, total: countResult.rows[0].total })
-})
-
-app.get('/api/moderation/papers/:id', auth, requireModerator, async (req, res) => {
-  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
-  const { rows } = await pool.query(`
-    SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.pdf_filename,
-      p.pdf_size, p.additional_notes, p.status, p.rejection_reason, p.created_at, p.reviewed_at,
-      submitter.name AS submitter_name, submitter.email AS submitter_email,
-      reviewer.name AS reviewer_name,
-      COALESCE((SELECT jsonb_agg(jsonb_build_object('id', pr.id, 'decision', pr.decision,
-        'comment', pr.comment, 'created_at', pr.created_at, 'reviewer_name', review_user.name)
-        ORDER BY pr.created_at DESC, pr.id DESC)
-        FROM paper_reviews pr LEFT JOIN users review_user ON review_user.id = pr.reviewer_id
-        WHERE pr.paper_id = p.id), '[]'::jsonb) AS review_history
-    FROM papers p JOIN users submitter ON submitter.id = p.user_id
-    LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by WHERE p.id = $1`, [req.params.id])
-  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
-  res.json(rows[0])
-})
-
-app.patch('/api/moderation/papers/:id/approve', auth, requireModerator, async (req, res) => {
-  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
-  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : ''
-  if (comment.length > 2000) return res.status(400).json({ error: 'Review comment must be at most 2,000 characters', field: 'comment' })
-  const { rows } = await pool.query(`
-    WITH changed AS (
-      UPDATE papers SET status = 'approved', reviewed_by = $2, reviewed_at = now(), rejection_reason = NULL, updated_at = now()
-      WHERE id = $1 AND status = 'pending' RETURNING id, title, user_id, status, reviewed_by, reviewed_at
-    ), review AS (
-      INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment)
-      SELECT id, $2, 'approved', $3 FROM changed RETURNING paper_id
-    ), logged AS (
-      INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
-      SELECT $2, 'paper.approved', 'paper', id::text, jsonb_build_object('comment', $3) FROM changed RETURNING id
-    ), notified AS (
-      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
-      SELECT user_id, $2, 'paper_review', 'paper', id, 'Your paper "' || title || '" was approved'
-      FROM changed WHERE user_id <> $2 RETURNING id
-    ) SELECT id, status, reviewed_by, reviewed_at FROM changed`, [req.params.id, req.userId, comment])
-  if (!rows[0]) {
-    const exists = await pool.query('SELECT 1 FROM papers WHERE id = $1', [req.params.id])
-    return res.status(exists.rowCount ? 409 : 404).json({ error: exists.rowCount ? 'Paper has already been reviewed' : 'Paper not found' })
-  }
-  res.json(rows[0])
-})
-
-app.patch('/api/moderation/papers/:id/reject', auth, requireModerator, async (req, res) => {
-  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
-  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : ''
-  if (reason.length < 5 || reason.length > 2000) return res.status(400).json({ error: 'Rejection reason must be 5 to 2,000 characters', field: 'reason' })
-  const { rows } = await pool.query(`
-    WITH changed AS (
-      UPDATE papers SET status = 'rejected', reviewed_by = $2, reviewed_at = now(), rejection_reason = $3, updated_at = now()
-      WHERE id = $1 AND status = 'pending' RETURNING id, title, user_id, status, reviewed_by, reviewed_at, rejection_reason
-    ), review AS (
-      INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment)
-      SELECT id, $2, 'rejected', $3 FROM changed RETURNING paper_id
-    ), logged AS (
-      INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
-      SELECT $2, 'paper.rejected', 'paper', id::text, jsonb_build_object('reason', $3) FROM changed RETURNING id
-    ), notified AS (
-      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
-      SELECT user_id, $2, 'paper_review', 'paper', id, 'Your paper "' || title || '" was rejected'
-      FROM changed WHERE user_id <> $2 RETURNING id
-    ) SELECT id, status, reviewed_by, reviewed_at, rejection_reason FROM changed`, [req.params.id, req.userId, reason])
-  if (!rows[0]) {
-    const exists = await pool.query('SELECT 1 FROM papers WHERE id = $1', [req.params.id])
-    return res.status(exists.rowCount ? 409 : 404).json({ error: exists.rowCount ? 'Paper has already been reviewed' : 'Paper not found' })
-  }
-  res.json(rows[0])
 })
 
 app.get('/api/papers/:id/pdf', auth, async (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
   const { rows } = await pool.query(
-    'SELECT id, user_id, status, pdf_data, pdf_filename FROM papers WHERE id = $1',
+    'SELECT id, user_id, status, authors, pdf_data, pdf_filename FROM papers WHERE id = $1',
     [req.params.id]
   )
   const paper = rows[0]
-  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+  if (!paper || !canReadPaperPdf(paper, req)) return res.status(404).json({ error: 'Paper not found' })
+  sendPdf(res, paper)
+})
 
-  if (String(paper.user_id) !== String(req.userId) && paper.status !== 'approved') {
-    const { rows: userRows } = await pool.query('SELECT role FROM users WHERE id = $1', [req.userId])
-    if (!['admin', 'moderator'].includes(userRows[0]?.role)) {
-      return res.status(404).json({ error: 'Paper not found' })
-    }
-  }
+const OPEN_FOR_REVIEW = ['pending', 'under_review']
+const isOpenForReview = (status) => OPEN_FOR_REVIEW.includes(status)
 
+function canReadPaperPdf(paper, req) {
+  return paper.status === 'published' || String(paper.user_id) === String(req.userId) || isModerator(req) ||
+    (paper.authors ?? []).some((a) => String(a.user_id) === String(req.userId)) ||
+    (OPEN_FOR_REVIEW.includes(paper.status) && isReviewer(req))
+}
+
+function sendPdf(res, paper) {
   const filename = paper.pdf_filename.replace(/[\r\n"\\]/g, '_')
   const asciiFilename = filename.replace(/[^\x20-\x7E]/g, '_')
   const encodedFilename = encodeURIComponent(filename).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
@@ -1307,22 +3131,505 @@ app.get('/api/papers/:id/pdf', auth, async (req, res) => {
     'X-Content-Type-Options': 'nosniff',
   })
   res.send(paper.pdf_data)
+}
+
+function requireReviewer(req, res, next) {
+  if (!isReviewer(req)) return res.status(403).json({ error: 'Peer review is open to authors, moderators and admins' })
+  next()
+}
+
+const REVIEW_SELECT = `
+  SELECT r.id::text AS id, r.paper_id, r.round, r.reviewer_id, u.name AS reviewer_name, r.overall_rating,
+    r.originality, r.methodology, r.clarity, r.significance, r.recommendation, r.comments,
+    r.confidential_comments, r.created_at, r.updated_at,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', s.id::text, 'section', s.section, 'body', s.body,
+      'status', s.status, 'author_response', s.author_response) ORDER BY s.position)
+      FROM review_suggestions s WHERE s.review_id = r.id), '[]'::jsonb) AS suggestions
+  FROM peer_reviews r LEFT JOIN users u ON u.id = r.reviewer_id`
+
+const roundSummary = (reviews) => ({
+  count: reviews.length,
+  overall: average(reviews.map((r) => r.overall_rating)),
+  ...Object.fromEntries(CRITERIA.map((c) => [c, average(reviews.map((r) => r[c]))])),
+  recommendations: Object.fromEntries(RECOMMENDATIONS.map((rec) => [rec, reviews.filter((r) => r.recommendation === rec).length])),
+})
+
+async function paperVersions(paperId, current) {
+  const { rows } = await pool.query(
+    'SELECT round, draft, title, pdf_filename, pdf_size, submitted_at FROM paper_versions WHERE paper_id = $1 ORDER BY round, draft',
+    [paperId]
+  )
+  return [...rows, {
+    round: current.round, draft: current.draft ?? 1, title: current.title, pdf_filename: current.pdf_filename, pdf_size: current.pdf_size,
+    submitted_at: (current.draft ?? 1) > 1 ? current.updated_at : current.resubmitted_at ?? current.created_at, current: true,
+  }]
+}
+
+app.get('/api/reviews/queue', auth, requireReviewer, async (req, res) => {
+  if (req.query.scope === 'mine') {
+    const { rows } = await pool.query(`
+      SELECT r.id::text AS review_id, r.round, r.overall_rating, r.recommendation, r.updated_at,
+        p.id, p.title, p.domain, p.status, p.round AS current_round
+      FROM peer_reviews r JOIN papers p ON p.id = r.paper_id
+      WHERE r.reviewer_id = $1 ORDER BY r.updated_at DESC LIMIT 100`, [req.userId])
+    return res.json(rows)
+  }
+  const { rows } = await pool.query(`
+    SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.round, p.created_at, p.resubmitted_at,
+      (SELECT count(*)::int FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round) AS review_count,
+      EXISTS (SELECT 1 FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round AND r.reviewer_id = $1) AS reviewed_by_me,
+      EXISTS (SELECT 1 FROM peer_reviews r WHERE r.paper_id = p.id AND r.round < p.round AND r.reviewer_id = $1) AS reviewed_earlier
+    FROM papers p WHERE p.status IN ('pending', 'under_review') AND p.user_id <> $1 AND NOT p.authors @> jsonb_build_array(jsonb_build_object('user_id', $1::int))
+    ORDER BY reviewed_by_me, reviewed_earlier DESC, COALESCE(p.resubmitted_at, p.created_at) LIMIT 100`, [req.userId])
+  res.json(rows)
+})
+
+app.get('/api/reviews/papers/:id', auth, requireReviewer, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const moderator = isModerator(req)
+  const { rows } = await pool.query(`
+    SELECT p.id, p.user_id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.additional_notes,
+      p.pdf_filename, p.pdf_size, p.status, p.round, p.draft, p.revision_note, p.rejection_reason, p.created_at, p.updated_at,
+      p.resubmitted_at, p.reviewed_at, u.name AS submitter_name, u.email AS submitter_email
+    FROM papers p JOIN users u ON u.id = p.user_id WHERE p.id = $1`, [req.params.id])
+  const paper = rows[0]
+  const reviewedBefore = paper && (await pool.query('SELECT 1 FROM peer_reviews WHERE paper_id = $1 AND reviewer_id = $2', [paper.id, req.userId])).rowCount > 0
+  const coauthor = paper && (paper.authors ?? []).some((a) => String(a.user_id) === String(req.userId))
+  if (!paper || (!moderator && (String(paper.user_id) === String(req.userId) || coauthor || (!isOpenForReview(paper.status) && !reviewedBefore)))) {
+    return res.status(404).json({ error: 'Paper not found' })
+  }
+  const { rows: reviews } = await pool.query(`${REVIEW_SELECT} WHERE r.paper_id = $1 ORDER BY r.round, r.created_at, r.id`, [paper.id])
+  const { rows: history } = await pool.query(`
+    SELECT pr.id, pr.decision, pr.comment, pr.round, pr.created_at, u.name AS actor_name
+    FROM paper_reviews pr LEFT JOIN users u ON u.id = pr.reviewer_id
+    WHERE pr.paper_id = $1 ORDER BY pr.created_at, pr.id`, [paper.id])
+  const mine = reviews.find((r) => r.round === paper.round && String(r.reviewer_id) === String(req.userId)) ?? null
+  const responseLetter = history.findLast((h) => h.decision === 'resubmitted' && h.round === paper.round)?.comment ?? null
+  const base = {
+    ...paper,
+    submitter_email: moderator ? paper.submitter_email : undefined,
+    versions: await paperVersions(paper.id, paper),
+    response_letter: responseLetter,
+    previous_round: anonymise(reviews).filter((r) => r.round === paper.round - 1),
+    my_review: mine,
+    can_review: isOpenForReview(paper.status) && String(paper.user_id) !== String(req.userId) && !coauthor,
+  }
+  if (!moderator) return res.json(base)
+  res.json({
+    ...base,
+    coauthor_checks: await coauthorChecks(paper),
+    reviews,
+    summary: roundSummary(reviews.filter((r) => r.round === paper.round)),
+    history,
+  })
+})
+
+app.put('/api/reviews/papers/:id', auth, requireReviewer, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  let review
+  try {
+    review = validateReview(req.body ?? {})
+  } catch (err) {
+    if (err.field) return res.status(400).json({ error: err.message, field: err.field })
+    throw err
+  }
+  const client = await pool.connect()
+  let open = false
+  try {
+    await client.query('BEGIN')
+    open = true
+    const stop = async (status, body) => { await client.query('ROLLBACK'); open = false; return res.status(status).json(body) }
+    const { rows } = await client.query('SELECT id, user_id, title, status, round, authors FROM papers WHERE id = $1 FOR UPDATE', [req.params.id])
+    const paper = rows[0]
+    if (!paper || String(paper.user_id) === String(req.userId)) return await stop(404, { error: 'Paper not found' })
+    if ((paper.authors ?? []).some((a) => String(a.user_id) === String(req.userId))) return await stop(403, { error: 'Co-authors cannot review their own paper' })
+    if (!isOpenForReview(paper.status)) return await stop(409, { error: 'This paper is no longer under review' })
+    const { rows: saved } = await client.query(`
+      INSERT INTO peer_reviews (paper_id, round, reviewer_id, overall_rating, originality, methodology, clarity,
+        significance, recommendation, comments, confidential_comments)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (paper_id, round, reviewer_id) DO UPDATE SET
+        overall_rating = EXCLUDED.overall_rating, originality = EXCLUDED.originality,
+        methodology = EXCLUDED.methodology, clarity = EXCLUDED.clarity, significance = EXCLUDED.significance,
+        recommendation = EXCLUDED.recommendation, comments = EXCLUDED.comments,
+        confidential_comments = EXCLUDED.confidential_comments, updated_at = now()
+      RETURNING id, (xmax = 0) AS inserted`,
+      [paper.id, paper.round, req.userId, review.overallRating, review.scores.originality, review.scores.methodology,
+        review.scores.clarity, review.scores.significance, review.recommendation, review.comments, review.confidential]
+    )
+    await client.query('DELETE FROM review_suggestions WHERE review_id = $1', [saved[0].id])
+    for (const [position, item] of review.suggestions.entries()) {
+      await client.query(
+        'INSERT INTO review_suggestions (review_id, position, section, body) VALUES ($1, $2, $3, $4)',
+        [saved[0].id, position, item.section, item.body]
+      )
+    }
+    if (saved[0].inserted) {
+      await client.query(
+        `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+         VALUES ($1, NULL, 'paper_review', 'paper', $2, $3)`,
+        [paper.user_id, paper.id, `A reviewer sent feedback on "${paper.title.slice(0, 300)}"`]
+      )
+    }
+    const { rows: ready } = await client.query(`SELECT (p.status IN ('pending', 'under_review')
+        AND EXISTS (SELECT 1 FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round)
+        AND NOT EXISTS (SELECT 1 FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round AND r.recommendation <> 'accept')) AS ready FROM papers p WHERE p.id = $1`, [paper.id])
+    if (ready[0].ready && review.recommendation === 'accept') {
+      await client.query(
+        `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+         SELECT $1, NULL, 'paper_review', 'paper', $2::bigint, $3::text
+         WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE user_id = $1 AND entity_type = 'paper' AND entity_id = $2::bigint AND text = $3::text)`,
+        [paper.user_id, paper.id, `Reviewers recommend accepting "${paper.title.slice(0, 300)}". A moderator will make the final decision.`]
+      )
+    }
+    await client.query('COMMIT')
+    open = false
+    const { rows: result } = await pool.query(`${REVIEW_SELECT} WHERE r.id = $1`, [saved[0].id])
+    res.status(saved[0].inserted ? 201 : 200).json(result[0])
+  } catch (err) {
+    if (open) await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+app.get('/api/papers/:id/feedback', auth, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(`
+    SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.additional_notes, p.pdf_filename, p.pdf_size,
+      p.status, p.round, p.draft, p.revision_note, p.rejection_reason, p.created_at, p.resubmitted_at, p.reviewed_at, p.updated_at,
+      p.user_id = $2 AS is_owner, u.name AS submitter_name
+    FROM papers p JOIN users u ON u.id = p.user_id
+    WHERE p.id = $1 AND (p.user_id = $2 OR p.authors @> jsonb_build_array(jsonb_build_object('user_id', $2::int)))`, [req.params.id, req.userId])
+  const paper = rows[0]
+  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+  const { rows: all } = await pool.query(`${REVIEW_SELECT} WHERE r.paper_id = $1 ORDER BY r.round, r.created_at, r.id`, [paper.id])
+  const visible = anonymise(all).filter((r) => r.round < paper.round || !isOpenForReview(paper.status))
+  const { rows: history } = await pool.query(
+    'SELECT id, decision, comment, round, created_at FROM paper_reviews WHERE paper_id = $1 ORDER BY created_at, id',
+    [paper.id]
+  )
+  res.json({
+    ...paper,
+    coauthor_checks: await coauthorChecks(paper),
+    my_check_allowed: !paper.is_owner && paper.status === 'coauthor_check',
+    reviews: visible,
+    pending_review_count: isOpenForReview(paper.status) ? all.filter((r) => r.round === paper.round).length : 0,
+    accept_count: isOpenForReview(paper.status) ? all.filter((r) => r.round === paper.round && r.recommendation === 'accept').length : 0,
+    can_publish: paper.is_owner && nextStatus(paper.status, 'publish') === 'published',
+    summary: roundSummary(visible.filter((r) => r.round === paper.round)),
+    history,
+    versions: await paperVersions(paper.id, paper),
+  })
+})
+
+async function coauthorChecks(paper) {
+  const { rows } = await pool.query(
+    `SELECT c.round, c.draft, c.user_id, u.name, c.decision, c.comment, c.updated_at
+     FROM coauthor_checks c JOIN users u ON u.id = c.user_id WHERE c.paper_id = $1 ORDER BY c.round, c.draft, c.updated_at`,
+    [paper.id]
+  )
+  const coauthors = (paper.authors ?? []).slice(1).filter((a) => a.user_id)
+  if (!coauthors.length) return []
+  const draft = paper.draft ?? 1
+  const keys = [...new Set([...rows.map((r) => `${r.round}:${r.draft}`), `${paper.round}:${draft}`])]
+    .map((k) => k.split(':').map(Number)).sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  return keys.map(([round, d]) => ({
+    round,
+    draft: d,
+    current: round === paper.round && d === draft,
+    checks: coauthors.map((a) => rows.find((r) => r.round === round && r.draft === d && String(r.user_id) === String(a.user_id))
+      ?? { round, draft: d, user_id: a.user_id, name: a.name, decision: null, comment: '' }),
+  }))
+}
+
+async function notifyPreviousReviewers(db, paperId, title, exceptUserId) {
+  await db.query(`
+    INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+    SELECT DISTINCT reviewer_id, NULL::int, 'review_request', 'paper', $1::bigint, $2
+    FROM peer_reviews WHERE paper_id = $1 AND reviewer_id IS NOT NULL AND reviewer_id <> $3`,
+  [paperId, `"${title.slice(0, 300)}" was revised and is ready for another review`, exceptUserId])
+}
+
+app.post('/api/papers/:id/coauthor-update', auth, writeLimiter, paperUpload.single('pdf'), async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const note = typeof req.body?.note === 'string' ? req.body.note.trim() : ''
+  if (!req.file) return res.status(400).json({ error: 'Choose the corrected PDF', field: 'pdf' })
+  if (!isPdf(req.file.buffer)) return res.status(400).json({ error: 'The selected file is not a valid PDF', field: 'pdf' })
+  if (note.length < 5 || note.length > 2000) return res.status(400).json({ error: 'Tell your co-authors what you changed (5 to 2,000 characters)', field: 'note' })
+  const filename = String(req.file.originalname || 'paper.pdf').replace(/\\/g, '/').split('/').at(-1).replace(/[\r\n\0]/g, '').slice(0, 255) || 'paper.pdf'
+  const client = await pool.connect()
+  let open = false
+  try {
+    await client.query('BEGIN')
+    open = true
+    const { rows } = await client.query(
+      `SELECT p.id, p.title, p.status, p.round, p.draft, p.authors, u.name FROM papers p JOIN users u ON u.id = p.user_id
+       WHERE p.id = $1 AND p.user_id = $2 FOR UPDATE OF p`,
+      [req.params.id, req.userId]
+    )
+    const paper = rows[0]
+    const stop = async (status, body) => { await client.query('ROLLBACK'); open = false; return res.status(status).json(body) }
+    if (!paper) return await stop(404, { error: 'Paper not found' })
+    if (paper.status !== 'coauthor_check') return await stop(409, { error: 'You can upload a corrected PDF only while your co-authors are checking the paper' })
+    await client.query(`
+      INSERT INTO paper_versions (paper_id, round, draft, title, abstract, pdf_data, pdf_filename, pdf_size, submitted_at)
+      SELECT id, round, draft, title, abstract, pdf_data, pdf_filename, pdf_size, CASE WHEN draft > 1 THEN updated_at ELSE COALESCE(resubmitted_at, created_at) END
+      FROM papers WHERE id = $1`, [paper.id])
+    const { rows: updated } = await client.query(
+      `UPDATE papers SET pdf_data = $2, pdf_filename = $3, pdf_size = $4, draft = draft + 1, updated_at = now()
+       WHERE id = $1 RETURNING round, draft`,
+      [paper.id, req.file.buffer, filename, req.file.size]
+    )
+    await client.query(
+      "INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, 'coauthor_update', $3, $4)",
+      [paper.id, req.userId, note, paper.round]
+    )
+    await client.query(`
+      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+      SELECT (a->>'user_id')::int, $3::int, 'coauthor', 'paper', $1::bigint, $2::text
+      FROM jsonb_array_elements($4::jsonb) AS a WHERE (a->>'user_id')::int <> $3`,
+      [paper.id, `${paper.name} uploaded a corrected PDF of "${paper.title.slice(0, 300)}". Please check it again.`, req.userId, JSON.stringify(paper.authors)]
+    )
+    await client.query('COMMIT')
+    open = false
+    res.json(updated[0])
+  } catch (err) {
+    if (open) await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+app.put('/api/papers/:id/coauthor-check', auth, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const decision = req.body?.decision
+  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : ''
+  if (!['approve', 'changes'].includes(decision)) return res.status(400).json({ error: 'Choose approve or request changes', field: 'decision' })
+  if (decision === 'changes' && comment.length < 5) return res.status(400).json({ error: 'Explain what should change (at least 5 characters)', field: 'comment' })
+  if (comment.length > 3000) return res.status(400).json({ error: 'Comments must be 3,000 characters or fewer', field: 'comment' })
+  const { rows } = await pool.query(
+    `SELECT p.id, p.user_id, p.title, p.status, p.round, p.draft, p.authors, u.name AS checker
+     FROM papers p, users u WHERE p.id = $1 AND u.id = $2
+       AND p.authors @> jsonb_build_array(jsonb_build_object('user_id', $2::int)) AND p.user_id <> $2`,
+    [req.params.id, req.userId]
+  )
+  const paper = rows[0]
+  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+  if (paper.status !== 'coauthor_check') {
+    return res.status(409).json({ error: isOpenForReview(paper.status) ? 'All co-authors already approved this version; it is with the reviewers and moderators' : 'Co-author checks are closed for this paper' })
+  }
+  await pool.query(
+    `INSERT INTO coauthor_checks (paper_id, round, draft, user_id, decision, comment) VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (paper_id, round, draft, user_id) DO UPDATE SET decision = EXCLUDED.decision, comment = EXCLUDED.comment, updated_at = now()`,
+    [paper.id, paper.round, paper.draft, req.userId, decision, comment]
+  )
+  await pool.query(
+    `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text) VALUES ($1, $2, 'paper_review', 'paper', $3, $4)`,
+    [paper.user_id, req.userId, paper.id, `${paper.checker} ${decision === 'approve' ? 'approved' : 'asked for changes to'} "${paper.title.slice(0, 300)}"${decision === 'changes' && comment ? `: ${comment.slice(0, 120)}` : ''}`]
+  )
+  const coauthorIds = paper.authors.slice(1).map((a) => a.user_id).filter(Boolean)
+  const { rows: approvals } = await pool.query(
+    `SELECT count(*)::int AS n FROM coauthor_checks WHERE paper_id = $1 AND round = $2 AND draft = $3 AND decision = 'approve' AND user_id = ANY($4::int[])`,
+    [paper.id, paper.round, paper.draft, coauthorIds]
+  )
+  let status = paper.status
+  if (approvals[0].n === coauthorIds.length) {
+    const moved = await pool.query("UPDATE papers SET status = 'pending', updated_at = now() WHERE id = $1 AND status = 'coauthor_check' RETURNING status", [paper.id])
+    if (moved.rowCount) {
+      status = 'pending'
+      await pool.query("INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, NULL, 'coauthors_approved', '', $2)", [paper.id, paper.round])
+      await pool.query(
+        `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text) VALUES ($1, NULL, 'paper_review', 'paper', $2, $3)`,
+        [paper.user_id, paper.id, `All co-authors approved "${paper.title.slice(0, 300)}". It is now waiting for moderator verification.`]
+      )
+      if (paper.round > 1) await notifyPreviousReviewers(pool, paper.id, paper.title, paper.user_id)
+    }
+  }
+  res.json({ round: paper.round, draft: paper.draft, decision, comment, status, checks: await coauthorChecks({ ...paper, status }) })
+})
+
+const PUBLISH_BLOCKED = {
+  coauthor_check: 'Your co-authors must approve the PDF, then a moderator must verify the paper before it can be published.',
+  pending: 'A moderator must verify and approve this paper before you can publish it.',
+  under_review: 'A moderator is verifying this paper. You can publish it once it is approved.',
+  revision_requested: 'A moderator asked for changes. Revise and resubmit the paper first.',
+  rejected: 'Rejected papers cannot be published.',
+  published: 'This paper is already published',
+}
+
+app.post('/api/papers/:id/publish', auth, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const result = await inTransaction(async (db) => {
+    const { rows } = await db.query(
+      'SELECT id, user_id, title, status, round, authors FROM papers WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [req.params.id, req.userId]
+    )
+    const paper = rows[0]
+    if (!paper) return fail({ status: 404, error: 'Paper not found' })
+    if (nextStatus(paper.status, 'publish') !== 'published') {
+      return fail({ status: 409, error: PUBLISH_BLOCKED[paper.status] ?? 'This paper cannot be published', code: 'not_approved' })
+    }
+    const { rows: changed } = await db.query(
+      `UPDATE papers SET status = 'published', published_at = now(), published_by = $2, updated_at = now()
+       WHERE id = $1 RETURNING status, published_at, reviewed_at`,
+      [paper.id, req.userId]
+    )
+    await db.query(
+      "INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, 'published', 'Published by the author', $3)",
+      [paper.id, req.userId, paper.round]
+    )
+    await audit(db, req.userId, 'paper.published', 'paper', paper.id, { round: paper.round, from: paper.status })
+    await db.query(
+      `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+       SELECT (a->>'user_id')::int, $2::int, 'coauthor', 'paper', $1::bigint, $3::text
+       FROM jsonb_array_elements($4::jsonb) AS a WHERE a ? 'user_id' AND (a->>'user_id')::int <> $2`,
+      [paper.id, req.userId, `Your co-authored paper "${paper.title.slice(0, 300)}" is now published`, JSON.stringify(paper.authors)]
+    )
+    return { paper: changed[0] }
+  })
+  if (result.problem) return sendProblem(res, result.problem)
+  res.json(result.paper)
+})
+
+app.delete('/api/papers/:id', auth, writeLimiter, async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(
+    `SELECT p.id, p.title, p.status, p.round, p.authors, u.name FROM papers p JOIN users u ON u.id = p.user_id WHERE p.id = $1 AND p.user_id = $2`,
+    [req.params.id, req.userId]
+  )
+  const paper = rows[0]
+  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+  if (paper.status === 'published') return res.status(409).json({ error: 'Published papers cannot be withdrawn' })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+       SELECT (a->>'user_id')::int, $1::int, 'coauthor', 'user', $1::bigint, $2::text
+       FROM jsonb_array_elements($3::jsonb) AS a WHERE (a->>'user_id')::int <> $1`,
+      [req.userId, `${paper.name} withdrew "${paper.title.slice(0, 300)}"`, JSON.stringify(paper.authors ?? [])]
+    )
+    await client.query(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       VALUES ($1, 'paper.withdrawn', 'paper', $2::text, jsonb_build_object('title', $3::text, 'status', $4::text, 'round', $5::int))`,
+      [req.userId, paper.id, paper.title, paper.status, paper.round]
+    )
+    await client.query('DELETE FROM papers WHERE id = $1', [paper.id])
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+  res.status(204).end()
+})
+
+app.post('/api/papers/:id/resubmit', auth, writeLimiter, paperUpload.single('pdf'), async (req, res) => {
+  if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const client = await pool.connect()
+  let open = false
+  try {
+    await client.query('BEGIN')
+    open = true
+    const stop = async (status, body) => { await client.query('ROLLBACK'); open = false; return res.status(status).json(body) }
+    const { rows } = await client.query('SELECT id, title, status, round, authors FROM papers WHERE id = $1 AND user_id = $2 FOR UPDATE', [req.params.id, req.userId])
+    const paper = rows[0]
+    if (!paper) return await stop(404, { error: 'Paper not found' })
+    if (paper.status !== 'revision_requested') return await stop(409, { error: 'Only papers with requested changes can be resubmitted' })
+
+    const { rows: openRows } = await client.query(`
+      SELECT s.id::text AS id FROM review_suggestions s JOIN peer_reviews r ON r.id = s.review_id
+      WHERE r.paper_id = $1 AND r.round = $2 AND s.status = 'open'`, [paper.id, paper.round])
+    let revision
+    let details
+    try {
+      revision = validateResubmission(req.body ?? {}, openRows.map((r) => r.id))
+      details = validatePaperSubmission(req.body ?? {}, req.file, MAX_PDF_BYTES, { requireFile: false })
+    } catch (err) {
+      if (err.field) return await stop(400, { error: err.message, field: err.field })
+      throw err
+    }
+
+    await client.query(`
+      INSERT INTO paper_versions (paper_id, round, draft, title, abstract, pdf_data, pdf_filename, pdf_size, submitted_at)
+      SELECT id, round, draft, title, abstract, pdf_data, pdf_filename, pdf_size, CASE WHEN draft > 1 THEN updated_at ELSE COALESCE(resubmitted_at, created_at) END
+      FROM papers WHERE id = $1`, [paper.id])
+    for (const answer of revision.responses) {
+      await client.query(
+        'UPDATE review_suggestions SET status = $2, author_response = $3, responded_at = now() WHERE id = $1',
+        [answer.id, answer.status, answer.response]
+      )
+    }
+    const { rows: updated } = await client.query(`
+      UPDATE papers SET title = $2, abstract = $3, doi = $4, domain = $5, tags = $6, authors = $7::jsonb,
+        additional_notes = $8,
+        pdf_data = COALESCE($9, pdf_data), pdf_filename = COALESCE($10, pdf_filename), pdf_size = COALESCE($11, pdf_size),
+        round = round + 1, draft = 1, status = $12, resubmitted_at = now(), updated_at = now()
+      WHERE id = $1 RETURNING id, title, status, round, resubmitted_at`,
+      [paper.id, details.title, details.abstract, details.doi, details.domain, details.tags,
+        JSON.stringify(paper.authors.map((author, i) => ({ ...author, affiliation: details.authors[i]?.affiliation ?? author.affiliation }))),
+        details.additionalNotes, details.pdfData, details.filename, details.pdfSize,
+        paper.authors.length > 1 ? 'coauthor_check' : 'pending']
+    )
+    const next = updated[0]
+    await client.query(
+      "INSERT INTO paper_reviews (paper_id, reviewer_id, decision, comment, round) VALUES ($1, $2, 'resubmitted', $3, $4)",
+      [paper.id, req.userId, revision.responseLetter, next.round]
+    )
+    if (next.status === 'pending') await notifyPreviousReviewers(client, paper.id, next.title, req.userId)
+    await client.query(`
+      INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
+      SELECT (a->>'user_id')::int, $3::int, 'coauthor', 'paper', $1::bigint, $2::text
+      FROM jsonb_array_elements($4::jsonb) AS a WHERE (a->>'user_id')::int <> $3`,
+      [paper.id, `Round ${next.round} of "${next.title.slice(0, 300)}" is ready. Check the new PDF and approve it so it can go back to peer review.`, req.userId, JSON.stringify(paper.authors)]
+    )
+    await client.query(
+      "INSERT INTO audit_logs (actor_id, action, target_type, target_id, details) VALUES ($1, 'paper.resubmitted', 'paper', $2::text, jsonb_build_object('round', $3::int, 'newPdf', $4::boolean))",
+      [req.userId, paper.id, next.round, !!details.pdfData]
+    )
+    await client.query('COMMIT')
+    open = false
+    res.json(next)
+  } catch (err) {
+    if (open) await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+app.get('/api/papers/:id/versions/:round/pdf', auth, async (req, res) => {
+  const draft = /^\d{1,3}$/.test(String(req.query.draft ?? '1')) ? Number(req.query.draft ?? 1) : 0
+  if (!isSafeId(req.params.id) || !/^\d{1,2}$/.test(req.params.round) || !draft) return res.status(404).json({ error: 'Version not found' })
+  const { rows } = await pool.query(`
+    SELECT v.pdf_data, v.pdf_filename, p.user_id, p.status, p.authors FROM paper_versions v JOIN papers p ON p.id = v.paper_id
+    WHERE v.paper_id = $1 AND v.round = $2 AND v.draft = $3`, [req.params.id, req.params.round, draft])
+  if (!rows[0] || !canReadPaperPdf(rows[0], req)) return res.status(404).json({ error: 'Version not found' })
+  sendPdf(res, rows[0])
 })
 
 app.delete('/api/posts/:id', auth, async (req, res) => {
   const id = Number(req.params.id)
   if (!Number.isSafeInteger(id) || id <= 0 || id > 2147483647) return res.status(404).json({ error: 'Post not found' })
   const { rows } = await pool.query(
-    `WITH d AS (DELETE FROM posts WHERE id = $1 AND user_id = $2 RETURNING image_id),
-     di AS (DELETE FROM images WHERE id IN (SELECT image_id FROM d))
+    `WITH d AS (DELETE FROM posts WHERE id = $1 AND (user_id = $2 OR $3) RETURNING id, user_id, image_id),
+     di AS (DELETE FROM images WHERE id IN (SELECT image_id FROM d)),
+     logged AS (
+       INSERT INTO audit_logs (actor_id, action, target_type, target_id, details)
+       SELECT $2, 'post.remove', 'post', d.id::text, jsonb_build_object('authorId', d.user_id)
+       FROM d WHERE d.user_id <> $2
+     )
      SELECT count(*)::int AS n FROM d`,
-    [id, req.userId]
+    [id, req.userId, isModerator(req)]
   )
   if (!rows[0].n) return res.status(404).json({ error: 'Post not found' })
   res.status(204).end()
 })
 
-// Public by unguessable UUID so <img> tags work without auth headers
 app.get('/api/images/:id', async (req, res) => {
   if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).end()
   const { rows } = await pool.query('SELECT mime, data FROM images WHERE id = $1', [req.params.id])
@@ -1340,8 +3647,16 @@ app.get('/api/health', async (_req, res) => {
   }
 })
 
-// Express only treats 4-arg middleware as an error handler
-// eslint-disable-next-line no-unused-vars
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }))
+
+if (SERVE_FRONTEND) {
+  app.use(express.static(FRONTEND_DIST, {
+    index: false,
+    setHeaders: (res, path) => res.set('Cache-Control', /[\\/]assets[\\/]/.test(path) ? 'public, max-age=31536000, immutable' : 'no-cache'),
+  }))
+  app.get('/{*splat}', (_req, res) => res.set('Cache-Control', 'no-cache').sendFile('index.html', { root: FRONTEND_DIST }))
+}
+
 app.use((err, req, res, _next) => {
   if (err instanceof multer.MulterError) {
     const error = err.code === 'LIMIT_FILE_SIZE'
@@ -1358,7 +3673,28 @@ app.use((err, req, res, _next) => {
   res.status(err.status || 500).json({ error: err.status ? err.message : 'Server error' })
 })
 
-const server = app.listen(PORT, () => log('info', 'api_listening', { port: PORT, poolMax: PG_POOL_MAX }))
+const server = app.listen(PORT, (err) => {
+  if (err) {
+    log('error', 'api_listen_failed', { port: PORT, code: err.code ?? 'unknown' })
+    if (err.code === 'EADDRINUSE') console.error(`Port ${PORT} is already in use. Stop the other SNARP server or set PORT to a free port.`)
+    pool.end().finally(() => process.exit(1))
+    return
+  }
+  log('info', 'api_listening', { port: PORT, poolMax: PG_POOL_MAX, servesFrontend: SERVE_FRONTEND })
+  if (REQUIRE_EMAIL_VERIFICATION && IS_PRODUCTION && !APP_URL) {
+    log('warn', 'app_url_not_set', { message: `Emailed links point to http://localhost:${PORT}. Set APP_URL to the public address of the site.` })
+  }
+  if (mailer.configured) {
+    mailer.verify()
+      .then(() => log('info', 'smtp_ready', { message: 'SMTP login works; emails will be sent.' }))
+      .catch((err) => log('error', 'smtp_login_failed', { code: err.code ?? null, message: err.message }))
+  }
+  if (REQUIRE_EMAIL_VERIFICATION && !mailer.configured) {
+    log('warn', 'smtp_not_configured', { message: 'Verification emails are written to this log instead of being sent. Set SMTP_URL or SMTP_HOST to send them.' })
+  }
+})
+const docsSocket = attachCollaborationWebSocket(server, collaboration, log)
+
 let shuttingDown = false
 const shutdown = (signal) => {
   if (shuttingDown) return
@@ -1369,7 +3705,8 @@ const shutdown = (signal) => {
     server.closeAllConnections?.()
   }, 15000)
   timeout.unref()
-  server.close(async (err) => {
+  // Live editors are disconnected first and their unsaved changes written before the database closes.
+  flushCollaboration(collaboration, docsSocket).catch((err) => log('error', 'docs_flush_failed', { message: err.message })).finally(() => server.close(async (err) => {
     clearTimeout(timeout)
     try {
       await pool.end()
@@ -1379,7 +3716,7 @@ const shutdown = (signal) => {
       log('error', 'database_pool_close_failed', { code: closeError.code ?? 'unknown' })
       process.exitCode = 1
     }
-  })
+  }))
   server.closeIdleConnections?.()
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'))

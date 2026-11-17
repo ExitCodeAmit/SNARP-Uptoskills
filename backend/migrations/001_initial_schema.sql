@@ -1,5 +1,3 @@
--- Baseline schema and safe upgrades for databases created by the earlier
--- startup-based schema setup. All changes preserve existing rows.
 CREATE TABLE IF NOT EXISTS users (
   id            SERIAL PRIMARY KEY,
   name          VARCHAR(100) NOT NULL,
@@ -27,7 +25,6 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 CREATE INDEX IF NOT EXISTS posts_created_at_idx ON posts (created_at DESC);
 
--- Upgrade posts tables created before image support.
 ALTER TABLE posts ADD COLUMN IF NOT EXISTS image_id UUID REFERENCES images(id) ON DELETE SET NULL;
 ALTER TABLE posts DROP CONSTRAINT IF EXISTS posts_body_check;
 DO $$ BEGIN

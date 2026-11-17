@@ -1,4 +1,3 @@
-// Builds citations only from the fields provided; missing fields are left out, never invented
 const list = (v) => (Array.isArray(v) ? v : String(v ?? '').split(';')).map((s) => s.trim()).filter(Boolean)
 
 export function apa(m) {

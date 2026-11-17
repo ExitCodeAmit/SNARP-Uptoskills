@@ -18,7 +18,7 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_PDF_BYTES) {
+export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_PDF_BYTES, { requireFile = true } = {}) {
   const title = text(fields.title)
   const abstract = text(fields.abstract)
   const domain = text(fields.domain)
@@ -54,7 +54,10 @@ export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_
     if (!name || name.length > 120 || affiliation.length > 200 || (email && (!/^\S+@\S+\.\S+$/.test(email) || email.length > 255))) {
       throw Object.assign(new Error('Check each author name, affiliation, and email'), { field: 'authors' })
     }
-    return { name, affiliation, email }
+    if (author.user_id != null && !(Number.isSafeInteger(Number(author.user_id)) && Number(author.user_id) > 0)) {
+      throw Object.assign(new Error('Check each author account'), { field: 'authors' })
+    }
+    return author.user_id != null ? { name, affiliation, email, user_id: Number(author.user_id) } : { name, affiliation, email }
   })
   if (!authors.length || authors.length > 25) {
     throw Object.assign(new Error('Add between 1 and 25 authors'), { field: 'authors' })
@@ -63,6 +66,9 @@ export function validatePaperSubmission(fields, file, maxPdfBytes = DEFAULT_MAX_
   const limit = Number.isSafeInteger(maxPdfBytes) && maxPdfBytes > 0
     ? Math.min(maxPdfBytes, DEFAULT_MAX_PDF_BYTES)
     : DEFAULT_MAX_PDF_BYTES
+  if (!file && !requireFile) {
+    return { title, abstract, doi: doi || null, domain, tags, authors, additionalNotes: additionalNotes || null, filename: null, pdfSize: null, pdfData: null }
+  }
   if (!file) throw Object.assign(new Error('Choose a PDF to upload'), { field: 'pdf' })
   if (file.size > limit) throw Object.assign(new Error(`PDF must be ${Math.floor(limit / 1024 / 1024)} MB or smaller`), { field: 'pdf' })
   if (!isPdf(file.buffer)) throw Object.assign(new Error('The uploaded file is not a valid PDF'), { field: 'pdf' })
