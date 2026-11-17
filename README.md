@@ -140,8 +140,14 @@ PGUSER=postgres
 PGPASSWORD=your_password
 PGDATABASE=snarp     # created automatically if it does not exist
 PORT=5000
+GEMINI_API_KEY=your_google_ai_studio_key
+GEMINI_MODEL=gemini-2.5-flash
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.3-70b-versatile
 # JWT_SECRET is generated automatically on first run
 ```
+
+Create the Gemini key in [Google AI Studio](https://aistudio.google.com/app/apikey) and the Groq key in [Groq Console](https://console.groq.com/keys). Keep both in `backend/.env` only; never put them in frontend code or commit them.
 
 > Forgot your postgres password? See [Resetting the postgres password](#resetting-the-postgres-password).
 

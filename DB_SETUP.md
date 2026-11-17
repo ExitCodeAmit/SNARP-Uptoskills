@@ -229,6 +229,14 @@ PGDATABASE=snarp
 # Server Port
 PORT=5000
 
+# Gemini is used for paper-upload classification.
+GEMINI_API_KEY=your_google_ai_studio_key
+GEMINI_MODEL=gemini-2.5-flash
+
+# Groq is used for persistent chatbot responses.
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.3-70b-versatile
+
 # Max PDF upload size in bytes (default 10 MB)
 PAPER_MAX_PDF_BYTES=10485760
 
@@ -238,6 +246,7 @@ PAPER_MAX_PDF_BYTES=10485760
 
 > [!CAUTION]
 > Replace `your_actual_password_here` with the real PostgreSQL superuser password you set during installation. **Never commit the `.env` file to Git** — it is already in `.gitignore`.
+> Create `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/app/apikey) and `GROQ_API_KEY` in [Groq Console](https://console.groq.com/keys). Keep both only in `backend/.env`; never commit them or place them in frontend code.
 
 ### Environment Variables Explained
 
@@ -249,6 +258,10 @@ PAPER_MAX_PDF_BYTES=10485760
 | `PGPASSWORD`          | PostgreSQL user password                        | *(none)*    |
 | `PGDATABASE`          | Database name for the SNARP project             | `snarp`     |
 | `PORT`                | Express API server port                         | `5000`      |
+| `GEMINI_API_KEY`      | Backend key for paper-upload classification    | *(required for upload AI)* |
+| `GEMINI_MODEL`        | Gemini model name                              | `gemini-2.5-flash` |
+| `GROQ_API_KEY`        | Backend key for persistent chat                | *(required for chat)* |
+| `GROQ_MODEL`          | Groq model name                                 | `llama-3.3-70b-versatile` |
 | `PAPER_MAX_PDF_BYTES` | Maximum PDF upload size in bytes                | `10485760`  |
 | `JWT_SECRET`          | Secret key for JWT tokens (auto-generated)      | *(auto)*    |
 
@@ -490,3 +503,5 @@ Then kill the conflicting process or change `PGPORT` in `.env` to another port (
 ---
 
 > **You're all set!** The SNARP database is now configured and ready for development. 🚀
+
+test commit

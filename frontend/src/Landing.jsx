@@ -550,6 +550,7 @@ export default function Landing() {
         </nav>
         <div className="l-nav-ctas">
           <Link to="/login" className="l-login">Log in</Link>
+          <Link to="/chat" className="l-login">Try chat</Link>
           <Link to="/signup" className="btn btn-primary l-pill">Create account</Link>
         </div>
       </header>

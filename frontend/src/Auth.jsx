@@ -43,7 +43,11 @@ export default function Auth({ mode, onAuth }) {
         : { email: form.email, password: form.password }
       onAuth(await api(`/auth/${mode}`, { method: 'POST', body }), isSignup || form.remember)
     } catch (err) {
-      setServerError(err.message)
+      if (err.status === 409) {
+        setServerError(err.message || 'An account with this email already exists')
+      } else {
+        setServerError(err.message || 'Something went wrong. Please try again.')
+      }
       setSubmitting(false)
     }
   }

@@ -1,11 +1,12 @@
 // UI-only pages: they run on sample data from sample.js and save nothing yet
 import { useEffect, useRef, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Users, MapPin, Clock, FilePdf, Copy, Check, PaperPlaneRight, UploadSimple,
   Heart, ChatCircle, UsersThree, CalendarBlank, SealCheck, CaretDown, Plus, X,
 } from '@phosphor-icons/react'
 import { Avatar, PageHeader } from '../components/ui'
+import useChat from '../useChat'
 import { apa, bibtex } from '../cite'
 import { COMMUNITIES, EVENTS, CONVERSATIONS, NOTIFICATIONS, FAQ } from '../sample'
 import { api, apiBlob } from '../api'
@@ -95,13 +96,39 @@ function PaperPdf({ paperId, label = 'View paper' }) {
 
 function PublishedPaperCard({ paper }) {
   const authorNames = (paper.authors ?? []).map((author) => typeof author === 'string' ? author : author.name).filter(Boolean)
-  return <article className="panel article">
-    <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">Approved {new Date(paper.reviewed_at ?? paper.created_at).toLocaleDateString()}</time></div>
-    <h3>{paper.title}</h3>
-    <p className="article-authors">{authorNames.join(', ')}</p>
-    <p className="article-abstract">{paper.abstract}</p>
-    <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
-    <div className="article-actions"><PaperPdf paperId={paper.id} />{paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}</div>
+  const navigate = useNavigate()
+  const { openPaperChat } = useChat()
+  const [openingChat, setOpeningChat] = useState(false)
+  const [chatError, setChatError] = useState('')
+  const askAboutPaper = async () => {
+    setOpeningChat(true)
+    setChatError('')
+    try {
+      await openPaperChat(paper.id)
+      navigate('/chat')
+    } catch (error) {
+      setChatError(error.message)
+    } finally {
+      setOpeningChat(false)
+    }
+  }
+
+  return <article id={`paper-${paper.id}`} className="panel article">
+      <div className="paper-view-main">
+        <div className="article-meta"><span className="tag tag-blue">{paper.domain}</span><time className="muted-sm">Approved {new Date(paper.reviewed_at ?? paper.created_at).toLocaleDateString()}</time></div>
+        <h3>{paper.title}</h3>
+        <p className="article-authors">{authorNames.join(', ')}</p>
+        <p className="article-abstract">{paper.abstract}</p>
+        <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
+        <div className="article-actions">
+          <PaperPdf paperId={paper.id} />
+          <button type="button" className="btn btn-ghost btn-sm" onClick={askAboutPaper} disabled={openingChat}>
+            {openingChat ? 'Opening chat…' : 'Ask about this paper'}
+          </button>
+          {paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}
+        </div>
+        {chatError && <p className="field-error" role="alert">{chatError}</p>}
+      </div>
   </article>
 }
 
@@ -702,3 +729,4 @@ export function Search() {
     </div>
   )
 }
+export { default as ChatPanel } from '../components/ChatPanel'
