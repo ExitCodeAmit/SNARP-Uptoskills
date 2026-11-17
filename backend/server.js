@@ -1,3 +1,5 @@
+import { validateCitationInput } from './citations.js'
+import { extractReferenceMatches } from './reference-extractor.js'
 import { appendFileSync } from 'node:fs'
 import { randomBytes, randomUUID } from 'node:crypto'
 import express from 'express'
@@ -914,6 +916,24 @@ app.get('/api/papers/categories', auth, async (_req, res) => {
   res.json(rows.map(({ domain }) => domain))
 })
 
+
+
+app.get('/api/papers/my-submissions', auth, async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
+      status, rejection_reason, reviewed_at, created_at
+    FROM papers WHERE user_id = $1 ORDER BY created_at DESC`, [req.userId])
+  res.json(rows)
+})
+
+
+
+
+
+
+
+
+
 app.get('/api/papers/:id', auth, async (req, res) => {
   if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
   const { rows } = await pool.query(
@@ -1107,13 +1127,7 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
   res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
 })
 
-app.get('/api/papers/my-submissions', auth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
-      status, rejection_reason, reviewed_at, created_at
-    FROM papers WHERE user_id = $1 ORDER BY created_at DESC`, [req.userId])
-  res.json(rows)
-})
+
 
 app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
   const status = String(req.query.status ?? 'pending')
@@ -1339,6 +1353,623 @@ app.get('/api/health', async (_req, res) => {
     res.status(503).json({ status: 'unavailable' })
   }
 })
+
+
+
+
+// ==========================================
+// RESEARCH IMPACT & CITATION NETWORK
+// ==========================================
+
+// GET: Citation dashboard
+  
+
+// GET: Citation dashboard
+app.get('/api/citations/dashboard', auth, async (req, res, next) => {
+  try {
+    const search = typeof req.query.q === 'string'
+      ? req.query.q.trim().slice(0, 100)
+      : '';
+
+    const searchPattern = `%${search}%`;
+
+    const [
+      summary,
+      leaders,
+      recent,
+      monthly,
+      network,
+      myPapers,
+      discoverable
+    ] = await Promise.all([
+
+      // 1. Overall citation statistics
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total_citations,
+          COUNT(DISTINCT pc.cited_paper_id)::int AS cited_papers,
+          COUNT(DISTINCT pc.citing_paper_id)::int AS citing_papers
+        FROM paper_citations pc
+        JOIN papers source
+          ON source.id = pc.citing_paper_id
+          AND source.status = 'approved'
+        JOIN papers target
+          ON target.id = pc.cited_paper_id
+          AND target.status = 'approved'
+      `),
+
+      // 2. Most cited approved papers
+      pool.query(`
+        SELECT
+          target.id,
+          target.title,
+          target.domain,
+          COUNT(pc.id)::int AS citation_count
+        FROM papers target
+        LEFT JOIN paper_citations pc
+          ON pc.cited_paper_id = target.id
+        LEFT JOIN papers source
+          ON source.id = pc.citing_paper_id
+          AND source.status = 'approved'
+        WHERE target.status = 'approved'
+        GROUP BY target.id, target.title, target.domain, target.created_at
+        ORDER BY citation_count DESC, target.created_at DESC
+        LIMIT 10
+      `),
+
+      // 3. Recent valid citations
+      pool.query(`
+        SELECT
+          pc.id,
+          pc.created_at,
+          source.id AS citing_paper_id,
+          target.id AS cited_paper_id,
+          source.title AS citing_title,
+          target.title AS cited_title
+        FROM paper_citations pc
+        JOIN papers source
+          ON source.id = pc.citing_paper_id
+          AND source.status = 'approved'
+        JOIN papers target
+          ON target.id = pc.cited_paper_id
+          AND target.status = 'approved'
+        WHERE
+          $1 = ''
+          OR source.title ILIKE $2
+          OR target.title ILIKE $2
+        ORDER BY pc.created_at DESC
+        LIMIT 50
+      `, [search, searchPattern]),
+
+      // 4. Monthly citation activity for the last six months
+      pool.query(`
+        SELECT
+          TO_CHAR(months.month, 'Mon YYYY') AS month,
+          COUNT(pc.id) FILTER (
+            WHERE source.id IS NOT NULL
+              AND target.id IS NOT NULL
+          )::int AS citations
+        FROM generate_series(
+          date_trunc('month', CURRENT_DATE) - INTERVAL '5 months',
+          date_trunc('month', CURRENT_DATE),
+          INTERVAL '1 month'
+        ) AS months(month)
+        LEFT JOIN paper_citations pc
+          ON date_trunc('month', pc.created_at) = months.month
+        LEFT JOIN papers source
+          ON source.id = pc.citing_paper_id
+          AND source.status = 'approved'
+        LEFT JOIN papers target
+          ON target.id = pc.cited_paper_id
+          AND target.status = 'approved'
+        GROUP BY months.month
+        ORDER BY months.month
+      `),
+
+      // 5. Citation network edges
+      pool.query(`
+        SELECT
+          pc.id,
+          pc.citing_paper_id,
+          pc.cited_paper_id,
+          source.title AS citing_title,
+          target.title AS cited_title,
+          pc.created_at
+        FROM paper_citations pc
+        JOIN papers source
+          ON source.id = pc.citing_paper_id
+          AND source.status = 'approved'
+        JOIN papers target
+          ON target.id = pc.cited_paper_id
+          AND target.status = 'approved'
+        ORDER BY pc.created_at DESC
+        LIMIT 60
+      `),
+
+      // 6. Current user's own approved papers
+      pool.query(`
+        SELECT id, title, domain
+        FROM papers
+        WHERE user_id = $1
+          AND status = 'approved'
+        ORDER BY created_at DESC
+      `, [req.userId]),
+
+      // 7. Searchable approved research papers
+      pool.query(`
+        SELECT id, title, domain
+        FROM papers
+        WHERE status = 'approved'
+          AND (
+            $1 = ''
+            OR title ILIKE $2
+            OR abstract ILIKE $2
+            OR domain ILIKE $2
+          )
+        ORDER BY title ASC
+        LIMIT 100
+      `, [search, searchPattern])
+
+    ]);
+
+    res.json({
+      summary: summary.rows[0],
+      leaders: leaders.rows,
+      recent: recent.rows,
+      monthly: monthly.rows,
+      network: network.rows,
+      myPapers: myPapers.rows,
+      discoverable: discoverable.rows
+    });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+
+
+
+
+
+// POST: Register a citation
+app.post('/api/citations', auth, async (req, res, next) => {
+  try {
+    const { citingPaperId, citedPaperId } =
+      validateCitationInput(req.body ?? {});
+
+    const papers = await pool.query(`
+      SELECT id, user_id, status
+      FROM papers
+      WHERE id = ANY($1::bigint[])
+    `, [[citingPaperId, citedPaperId]]);
+
+    const citingPaper = papers.rows.find(
+      paper => String(paper.id) === String(citingPaperId)
+    );
+
+    const citedPaper = papers.rows.find(
+      paper => String(paper.id) === String(citedPaperId)
+    );
+
+    if (!citingPaper || !citedPaper ||
+        citingPaper.status !== 'approved' ||
+        citedPaper.status !== 'approved') {
+      return res.status(404).json({
+        error: 'Both papers must exist and be approved.'
+      });
+    }
+
+    if (String(citingPaper.user_id) !== String(req.userId)) {
+      return res.status(403).json({
+        error: 'You can only register citations from your own papers.'
+      });
+    }
+
+    const result = await pool.query(`
+      INSERT INTO paper_citations
+        (citing_paper_id, cited_paper_id, created_by)
+      VALUES ($1, $2, $3)
+      RETURNING id, citing_paper_id, cited_paper_id, created_at
+    `, [citingPaperId, citedPaperId, req.userId]);
+
+    res.status(201).json({
+      message: 'Citation registered successfully.',
+      citation: result.rows[0]
+    });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({
+        error: 'This citation already exists.'
+      });
+    }
+
+    if (err.status === 400 || err.field) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    next(err);
+  }
+});
+
+
+
+
+
+/* =========================================
+   AUTOMATIC PDF CITATION DETECTION
+========================================= */
+
+// Scan an author's approved PDF for references to other
+// approved papers already available in SNARP.
+app.post('/api/papers/:id/scan-references', auth, requireAuthor, async (req, res, next) => {
+  try {
+    if (!isPgBigId(req.params.id)) {
+      return res.status(404).json({ error: 'Paper not found.' });
+    }
+
+    const { rows: sourceRows } = await pool.query(
+      `SELECT id, user_id, title, status, pdf_data
+       FROM papers
+       WHERE id = $1`,
+      [req.params.id]
+    );
+
+    const source = sourceRows[0];
+
+    if (!source) {
+      return res.status(404).json({ error: 'Paper not found.' });
+    }
+
+    if (String(source.user_id) !== String(req.userId)) {
+      return res.status(403).json({
+        error: 'You can only scan your own papers.'
+      });
+    }
+
+    if (source.status !== 'approved') {
+      return res.status(409).json({
+        error: 'Your paper must be approved before scanning references.'
+      });
+    }
+
+    const { rows: approvedPapers } = await pool.query(
+      `SELECT p.id, p.title, p.doi
+       FROM papers p
+       WHERE p.status = 'approved'
+         AND p.id <> $1
+         AND NOT EXISTS (
+           SELECT 1
+           FROM paper_citations pc
+           WHERE pc.citing_paper_id = $1
+             AND pc.cited_paper_id = p.id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM citation_suggestions cs
+           WHERE cs.citing_paper_id = $1
+             AND cs.cited_paper_id = p.id
+         )
+       ORDER BY p.created_at DESC
+       LIMIT 500`,
+      [source.id]
+    );
+
+    const scan = await extractReferenceMatches(
+      source.pdf_data,
+      approvedPapers
+    );
+
+    let insertedCount = 0;
+
+    for (const match of scan.matches) {
+      const inserted = await pool.query(
+        `INSERT INTO citation_suggestions (
+           citing_paper_id,
+           cited_paper_id,
+           created_by,
+           match_type,
+           confidence,
+           evidence_text
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (citing_paper_id, cited_paper_id)
+         DO NOTHING
+         RETURNING id`,
+        [
+          source.id,
+          match.citedPaperId,
+          req.userId,
+          match.matchType,
+          match.confidence,
+          match.evidenceText
+        ]
+      );
+
+      if (inserted.rows[0]) insertedCount++;
+    }
+
+    const { rows: suggestions } = await pool.query(
+      `SELECT
+         cs.id,
+         cs.match_type,
+         cs.confidence,
+         cs.evidence_text,
+         cs.created_at,
+         source.id AS citing_paper_id,
+         source.title AS citing_title,
+         target.id AS cited_paper_id,
+         target.title AS cited_title
+       FROM citation_suggestions cs
+       JOIN papers source ON source.id = cs.citing_paper_id
+       JOIN papers target ON target.id = cs.cited_paper_id
+       WHERE cs.created_by = $1
+         AND cs.citing_paper_id = $2
+         AND cs.status = 'pending'
+         AND source.status = 'approved'
+         AND target.status = 'approved'
+       ORDER BY cs.confidence DESC, cs.created_at DESC`,
+      [req.userId, source.id]
+    );
+
+    res.json({
+      message: scan.referenceSectionFound
+        ? `${scan.matches.length} possible match(es) found. ${insertedCount} new suggestion(s) added.`
+        : scan.message,
+      referenceSectionFound: scan.referenceSectionFound,
+      matchedCount: scan.matches.length,
+      insertedCount,
+      suggestions
+    });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+// Get pending citation suggestions for the logged-in author.
+app.get('/api/citations/suggestions', auth, requireAuthor, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         cs.id,
+         cs.match_type,
+         cs.confidence,
+         cs.evidence_text,
+         cs.created_at,
+         source.id AS citing_paper_id,
+         source.title AS citing_title,
+         target.id AS cited_paper_id,
+         target.title AS cited_title
+       FROM citation_suggestions cs
+       JOIN papers source ON source.id = cs.citing_paper_id
+       JOIN papers target ON target.id = cs.cited_paper_id
+       WHERE cs.created_by = $1
+         AND cs.status = 'pending'
+         AND source.user_id = $1
+         AND source.status = 'approved'
+         AND target.status = 'approved'
+       ORDER BY cs.confidence DESC, cs.created_at DESC
+       LIMIT 50`,
+      [req.userId]
+    );
+
+    res.json({ suggestions: rows });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+// Accept a detected citation.
+// Only now is a real paper_citations record created.
+app.post('/api/citations/suggestions/:id/accept', auth, requireAuthor, async (req, res, next) => {
+  if (!isPgBigId(req.params.id)) {
+    return res.status(404).json({ error: 'Suggestion not found.' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      `SELECT
+         cs.id,
+         cs.citing_paper_id,
+         cs.cited_paper_id,
+         source.user_id AS source_owner,
+         source.status AS source_status,
+         target.status AS target_status
+       FROM citation_suggestions cs
+       JOIN papers source ON source.id = cs.citing_paper_id
+       JOIN papers target ON target.id = cs.cited_paper_id
+       WHERE cs.id = $1
+         AND cs.created_by = $2
+         AND cs.status = 'pending'
+       FOR UPDATE OF cs`,
+      [req.params.id, req.userId]
+    );
+
+    const suggestion = rows[0];
+
+    if (!suggestion) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        error: 'Pending citation suggestion not found.'
+      });
+    }
+
+    if (
+      String(suggestion.source_owner) !== String(req.userId) ||
+      suggestion.source_status !== 'approved' ||
+      suggestion.target_status !== 'approved'
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Both papers must remain approved and the citing paper must belong to you.'
+      });
+    }
+
+    const inserted = await client.query(
+      `INSERT INTO paper_citations (
+         citing_paper_id,
+         cited_paper_id,
+         created_by
+       )
+       VALUES ($1, $2, $3)
+       ON CONFLICT (citing_paper_id, cited_paper_id)
+       DO NOTHING
+       RETURNING id`,
+      [
+        suggestion.citing_paper_id,
+        suggestion.cited_paper_id,
+        req.userId
+      ]
+    );
+
+    let citationId = inserted.rows[0]?.id;
+
+    // Handle a citation that was registered manually in the meantime.
+    if (!citationId) {
+      const existing = await client.query(
+        `SELECT id
+         FROM paper_citations
+         WHERE citing_paper_id = $1
+           AND cited_paper_id = $2`,
+        [suggestion.citing_paper_id, suggestion.cited_paper_id]
+      );
+
+      citationId = existing.rows[0]?.id;
+    }
+
+    await client.query(
+      `UPDATE citation_suggestions
+       SET status = 'accepted',
+           citation_id = $2,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [suggestion.id, citationId]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      message: inserted.rows[0]
+        ? 'Detected citation accepted and registered.'
+        : 'This citation was already registered.',
+      citationId
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+
+// Dismiss an incorrect detected citation.
+app.post('/api/citations/suggestions/:id/dismiss', auth, requireAuthor, async (req, res, next) => {
+  try {
+    if (!isPgBigId(req.params.id)) {
+      return res.status(404).json({ error: 'Suggestion not found.' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE citation_suggestions cs
+       SET status = 'dismissed',
+           updated_at = NOW()
+       WHERE cs.id = $1
+         AND cs.created_by = $2
+         AND cs.status = 'pending'
+         AND EXISTS (
+           SELECT 1
+           FROM papers p
+           WHERE p.id = cs.citing_paper_id
+             AND p.user_id = $2
+         )
+       RETURNING cs.id`,
+      [req.params.id, req.userId]
+    );
+
+    if (!rows[0]) {
+      return res.status(404).json({
+        error: 'Pending suggestion not found.'
+      });
+    }
+
+    res.json({ message: 'Citation suggestion dismissed.' });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// DELETE: Remove a citation registered from your own paper
+app.delete('/api/citations/:id', auth, async (req, res, next) => {
+  try {
+    if (!isPgBigId(req.params.id)) {
+      return res.status(404).json({ error: 'Citation not found.' });
+    }
+
+    const result = await pool.query(`
+      DELETE FROM paper_citations pc
+      USING papers p
+      WHERE pc.id = $1
+        AND p.id = pc.citing_paper_id
+        AND p.user_id = $2
+      RETURNING pc.id
+    `, [req.params.id, req.userId]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: 'Citation not found or you do not have permission to delete it.'
+      });
+    }
+
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Express only treats 4-arg middleware as an error handler
 // eslint-disable-next-line no-unused-vars

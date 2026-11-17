@@ -1,0 +1,174 @@
+
+.citation-graph-panel {
+  margin-bottom: 18px;
+}
+
+.citation-graph-count {
+  color: #85899b;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.citation-graph-viewport {
+  width: 100%;
+  overflow: auto;
+  border: 1px solid #eeeef5;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle, #eceaf5 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.citation-graph-svg {
+  display: block;
+  width: 100%;
+  min-width: 720px;
+  height: auto;
+}
+
+.citation-graph-edge {
+  stroke: #9284dd;
+  stroke-width: 2;
+  opacity: 0.65;
+}
+
+.citation-graph-node {
+  cursor: pointer;
+  outline: none;
+}
+
+.citation-graph-node circle {
+  stroke-width: 3;
+  transition: 0.2s ease;
+}
+
+.citation-node-citing circle {
+  fill: #7563d8;
+  stroke: #d9d2ff;
+}
+
+.citation-node-cited circle {
+  fill: #438bd5;
+  stroke: #cce5ff;
+}
+
+.citation-node-connected circle {
+  fill: #279b79;
+  stroke: #c9f0df;
+}
+
+.citation-graph-node text {
+  fill: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  pointer-events: none;
+}
+
+.citation-graph-node:hover circle,
+.citation-graph-node.selected circle,
+.citation-graph-node:focus-visible circle {
+  stroke: #292c42;
+  stroke-width: 4;
+  r: 26;
+}
+
+.citation-graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  margin-top: 16px;
+  color: #74788c;
+  font-size: 11px;
+}
+
+.citation-graph-legend span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.citation-graph-legend i {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  border-radius: 50%;
+}
+
+.legend-citing {
+  background: #7563d8;
+}
+
+.legend-cited {
+  background: #438bd5;
+}
+
+.legend-connected {
+  background: #279b79;
+}
+
+.citation-graph-empty {
+  padding: 42px 20px;
+  text-align: center;
+  color: #85899b;
+}
+
+.citation-graph-empty-icon {
+  color: #8878db;
+  font-size: 40px;
+  margin-bottom: 10px;
+}
+
+.citation-graph-empty strong {
+  display: block;
+  color: #292c42;
+  font-size: 15px;
+}
+
+.citation-graph-empty p {
+  max-width: 430px;
+  margin: 9px auto 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.citation-graph-inspector {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid #eeeef5;
+  border-radius: 11px;
+  background: #fbfaff;
+}
+
+.citation-graph-inspector h3 {
+  margin: 7px 0;
+  color: #292c42;
+  font-size: 14px;
+}
+
+.citation-graph-inspector p {
+  margin: 0;
+  color: #85899b;
+  font-size: 11px;
+}
+
+.citation-graph-connections {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.citation-graph-connections div {
+  color: #55596d;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 620px) {
+  .citation-graph-panel {
+    padding: 17px 14px;
+  }
+
+  .citation-graph-legend {
+    gap: 12px;
+  }
+}

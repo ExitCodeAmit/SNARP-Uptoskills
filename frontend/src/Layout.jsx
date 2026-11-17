@@ -1,14 +1,39 @@
+
 import { useEffect, useState } from 'react'
-import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
-  UploadSimple, ShieldCheck, GearSix, Question, SignOut, List, X, MagnifyingGlass, Plus,
+  NavLink,
+  Link,
+  Outlet,
+  useNavigate,
+  useLocation,
+} from 'react-router-dom'
+
+import {
+  House,
+  UsersThree,
+  Article,
+  CalendarBlank,
+  ChatCircleDots,
+  Bell,
+  Quotes,
+  ChartLineUp,
+  UploadSimple,
+  ShieldCheck,
+  GearSix,
+  Question,
+  SignOut,
+  List,
+  X,
+  MagnifyingGlass,
+  Plus,
 } from '@phosphor-icons/react'
+
 import { Avatar } from './components/ui'
 import { ROLE_LABEL } from './format'
 import { api } from './api'
 import logo from './assets/logo.png'
 
+// Main navigation
 const MAIN_NAV = [
   { to: '/', label: 'Feed', icon: House, end: true },
   { to: '/communities', label: 'Communities', icon: UsersThree },
@@ -17,8 +42,14 @@ const MAIN_NAV = [
   { to: '/messages', label: 'Messages', icon: ChatCircleDots },
   { to: '/notifications', label: 'Notifications', icon: Bell },
   { to: '/tools', label: 'Citation tools', icon: Quotes },
+  {
+    to: '/citation-network',
+    label: 'Citation Network',
+    icon: ChartLineUp,
+  },
 ]
 
+// Workspace navigation
 const WORK_NAV = [
   { to: '/submit', label: 'Submit a paper', icon: UploadSimple },
   { to: '/my-submissions', label: 'My submissions', icon: Article },
@@ -26,15 +57,26 @@ const WORK_NAV = [
   { to: '/help', label: 'Help center', icon: Question },
 ]
 
+// Navigation group component
 function NavGroup({ title, items, onNavigate }) {
   return (
     <nav className="nav-group" aria-label={title}>
       <p className="nav-title">{title}</p>
+
       {items.map(({ to, label, icon: Icon, end, badge }) => (
-        <NavLink key={to} to={to} end={end} className="nav-item" onClick={onNavigate}>
+        <NavLink
+          key={to}
+          to={to}
+          end={end}
+          className="nav-item"
+          onClick={onNavigate}
+        >
           <Icon size={20} />
           <span>{label}</span>
-          {badge > 0 && <span className="nav-badge">{badge}</span>}
+
+          {badge > 0 && (
+            <span className="nav-badge">{badge}</span>
+          )}
         </NavLink>
       ))}
     </nav>
@@ -44,68 +86,157 @@ function NavGroup({ title, items, onNavigate }) {
 export default function Layout({ user, onLogout }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
-  const [unread, setUnread] = useState({ notifications: 0, messages: 0 })
+  const [unread, setUnread] = useState({
+    notifications: 0,
+    messages: 0,
+  })
+
   const navigate = useNavigate()
   const { pathname } = useLocation()
+
   const close = () => setOpen(false)
 
+  // Refresh unread notification and message counts
   useEffect(() => {
     let active = true
-    const refresh = () => api('/notifications/unread-count').then((counts) => { if (active) setUnread(counts) }).catch(() => {})
+
+    const refresh = () => {
+      api('/notifications/unread-count')
+        .then((counts) => {
+          if (active) setUnread(counts)
+        })
+        .catch(() => {})
+    }
+
     refresh()
+
     const interval = setInterval(refresh, 30000)
+
     window.addEventListener('snarp:unread-changed', refresh)
-    return () => { active = false; clearInterval(interval); window.removeEventListener('snarp:unread-changed', refresh) }
+
+    return () => {
+      active = false
+      clearInterval(interval)
+      window.removeEventListener('snarp:unread-changed', refresh)
+    }
   }, [pathname])
 
+  // Add unread badges to navigation items
   const navItems = MAIN_NAV.map((item) => ({
     ...item,
-    badge: item.to === '/messages' ? unread.messages : item.to === '/notifications' ? unread.notifications : 0,
+    badge:
+      item.to === '/messages'
+        ? unread.messages
+        : item.to === '/notifications'
+          ? unread.notifications
+          : 0,
   }))
 
+  // Handle search
   const search = (e) => {
     e.preventDefault()
-    if (query.trim()) navigate(`/search?q=${encodeURIComponent(query.trim())}`)
+
+    if (query.trim()) {
+      navigate(`/search?q=${encodeURIComponent(query.trim())}`)
+    }
   }
 
   return (
     <div className="shell">
+      {/* Sidebar */}
       <aside className={`sidebar ${open ? 'open' : ''}`}>
         <div className="sidebar-top">
           <Link to="/" onClick={close}>
-            <img src={logo} alt="UptoSkills" className="sidebar-logo" />
+            <img
+              src={logo}
+              alt="UptoSkills"
+              className="sidebar-logo"
+            />
           </Link>
-          <button className="icon-btn sidebar-close" onClick={close} aria-label="Close menu">
+
+          <button
+            className="icon-btn sidebar-close"
+            onClick={close}
+            aria-label="Close menu"
+          >
             <X size={20} />
           </button>
         </div>
 
         <div className="sidebar-scroll">
-          <NavGroup title="Discover" items={navItems} onNavigate={close} />
-          <NavGroup title="Workspace" items={WORK_NAV} onNavigate={close} />
-          {['admin', 'moderator'].includes(user.role) && <NavGroup title="Review" items={[{ to: '/moderation', label: 'Paper moderation', icon: ShieldCheck }]} onNavigate={close} />}
+          <NavGroup
+            title="Discover"
+            items={navItems}
+            onNavigate={close}
+          />
+
+          <NavGroup
+            title="Workspace"
+            items={WORK_NAV}
+            onNavigate={close}
+          />
+
+          {['admin', 'moderator'].includes(user.role) && (
+            <NavGroup
+              title="Review"
+              items={[
+                {
+                  to: '/moderation',
+                  label: 'Paper moderation',
+                  icon: ShieldCheck,
+                },
+              ]}
+              onNavigate={close}
+            />
+          )}
         </div>
 
+        {/* Logged-in user section */}
         <div className="sidebar-user">
-          <Avatar name={user.name} src={user.avatar_url} />
+          <Avatar
+            name={user.name}
+            src={user.avatar_url}
+          />
+
           <div className="sidebar-user-info">
             <strong>{user.name}</strong>
             <span>{ROLE_LABEL[user.role]}</span>
           </div>
-          <button className="icon-btn" onClick={onLogout} aria-label="Sign out" title="Sign out">
+
+          <button
+            className="icon-btn"
+            onClick={onLogout}
+            aria-label="Sign out"
+            title="Sign out"
+          >
             <SignOut size={20} />
           </button>
         </div>
       </aside>
-      {open && <div className="scrim" onClick={close} />}
 
+      {open && (
+        <div className="scrim" onClick={close} />
+      )}
+
+      {/* Main content */}
       <div className="main">
         <header className="topbar">
-          <button className="icon-btn menu-btn" onClick={() => setOpen(true)} aria-label="Open menu">
+          <button
+            className="icon-btn menu-btn"
+            onClick={() => setOpen(true)}
+            aria-label="Open menu"
+          >
             <List size={22} />
           </button>
-          <form className="search" role="search" onSubmit={search}>
+
+          {/* Search bar */}
+          <form
+            className="search"
+            role="search"
+            onSubmit={search}
+          >
             <MagnifyingGlass size={18} />
+
             <input
               type="search"
               placeholder="Search researchers, posts, papers, communities"
@@ -114,11 +245,28 @@ export default function Layout({ user, onLogout }) {
               onChange={(e) => setQuery(e.target.value)}
             />
           </form>
+
           <div className="topbar-actions">
-            <NavLink to="/notifications" className={`icon-btn icon-btn-lg ${unread.notifications ? 'has-dot' : ''}`} aria-label={unread.notifications ? `Notifications, ${unread.notifications} unread` : 'Notifications'}>
+            <NavLink
+              to="/notifications"
+              className={`icon-btn icon-btn-lg ${
+                unread.notifications ? 'has-dot' : ''
+              }`}
+              aria-label={
+                unread.notifications
+                  ? `Notifications, ${unread.notifications} unread`
+                  : 'Notifications'
+              }
+            >
               <Bell size={22} />
-              {unread.notifications > 0 && <span className="nav-badge topbar-badge">{unread.notifications}</span>}
+
+              {unread.notifications > 0 && (
+                <span className="nav-badge topbar-badge">
+                  {unread.notifications}
+                </span>
+              )}
             </NavLink>
+
             {pathname !== '/submit' && (
               <Link to="/submit" className="btn btn-primary">
                 <Plus size={18} weight="bold" />
@@ -128,6 +276,7 @@ export default function Layout({ user, onLogout }) {
           </div>
         </header>
 
+        {/* Page content */}
         <div className="content">
           <Outlet />
         </div>

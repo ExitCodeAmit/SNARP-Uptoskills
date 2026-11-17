@@ -1,0 +1,207 @@
+/* Styles for the automatic PDF citation scan and suggestion review area. */
+.citation-auto-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 20px;
+  margin: 24px 0;
+  align-items: start;
+}
+
+.citation-auto-panel {
+  min-width: 0;
+}
+
+.citation-auto-scan-row {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.citation-auto-field {
+  display: grid;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.citation-auto-field select {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #d8dce5);
+  border-radius: 9px;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+  font-weight: 400;
+}
+
+.citation-auto-scan-button {
+  min-height: 44px;
+  white-space: nowrap;
+}
+
+.citation-auto-note {
+  margin: 14px 0 0;
+  color: var(--text-muted, #687386);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.citation-auto-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 32px;
+  height: 32px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--surface-muted, #f0f2f7);
+  color: var(--text-color, #273247);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.citation-suggestion-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.citation-suggestion {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border-color, #e0e4ec);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.citation-suggestion-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.citation-suggestion-type {
+  color: var(--accent-color, #6256c7);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+}
+
+.citation-suggestion-confidence {
+  color: var(--text-muted, #687386);
+  font-size: 0.78rem;
+}
+
+.citation-suggestion-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.citation-suggestion-flow > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.citation-suggestion-flow small {
+  color: var(--text-muted, #687386);
+  font-size: 0.72rem;
+}
+
+.citation-suggestion-flow strong {
+  overflow-wrap: anywhere;
+  font-size: 0.88rem;
+  line-height: 1.4;
+}
+
+.citation-suggestion-flow > span {
+  color: var(--accent-color, #6256c7);
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.citation-suggestion-evidence {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-color, #6256c7);
+  border-radius: 5px;
+  background: var(--surface-muted, #f5f6fa);
+  color: var(--text-muted, #596579);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.citation-suggestion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-top: 13px;
+}
+
+.citation-suggestion-actions button {
+  min-height: 36px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.citation-suggestion-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.citation-suggestion-accept {
+  border: 1px solid var(--accent-color, #6256c7);
+  background: var(--accent-color, #6256c7);
+  color: #fff;
+}
+
+.citation-suggestion-dismiss {
+  border: 1px solid var(--border-color, #d8dce5);
+  background: transparent;
+  color: inherit;
+}
+
+@media (max-width: 900px) {
+  .citation-auto-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .citation-auto-scan-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .citation-auto-scan-button {
+    width: 100%;
+  }
+
+  .citation-suggestion-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .citation-suggestion-flow > span {
+    transform: rotate(90deg);
+    justify-self: start;
+  }
+
+  .citation-suggestion-topline {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

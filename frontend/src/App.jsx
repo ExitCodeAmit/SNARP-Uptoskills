@@ -10,6 +10,7 @@ import { api, getToken, saveToken, clearToken } from './api'
 import Auth from './Auth'
 import Layout from './Layout'
 import Feed from './Feed'
+import CitationNetwork from './CitationNetwork'
 
 import {
   Communities,
@@ -66,6 +67,7 @@ export default function App() {
     } catch {
       // Clear the browser session even if the API cannot be reached.
     }
+
     clearToken()
     setUser(null)
   }
@@ -99,17 +101,36 @@ export default function App() {
             />
 
             <Route path="/communities" element={<Communities />} />
-            <Route path="/communities/:id" element={<CommunityDetail user={user} />} />
+            <Route
+              path="/communities/:id"
+              element={<CommunityDetail user={user} />}
+            />
+
             <Route path="/articles" element={<Articles />} />
             <Route path="/articles/:id" element={<PaperDetail />} />
+
             <Route path="/events" element={<Events user={user} />} />
-            <Route path="/events/:id" element={<EventDetail user={user} />} />
+            <Route
+              path="/events/:id"
+              element={<EventDetail user={user} />}
+            />
+
             <Route path="/messages" element={<Messages user={user} />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/tools" element={<Tools />} />
+
             <Route path="/submit" element={<Submit user={user} />} />
-            <Route path="/moderation" element={<Moderation user={user} />} />
+            <Route
+              path="/moderation"
+              element={<Moderation user={user} />}
+            />
             <Route path="/my-submissions" element={<MySubmissions />} />
+
+            {/* Citation Network */}
+            <Route
+              path="/citation-network"
+              element={<CitationNetwork />}
+            />
 
             <Route
               path="/settings"
