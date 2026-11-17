@@ -118,7 +118,7 @@ export default function App() {
 
             <Route path="/help" element={<Help />} />
             <Route path="/search" element={<Search />} />
-            <Route path="/users/:id" element={<UserProfile />} />
+            <Route path="/users/:id" element={<UserProfile user={user} />} />
           </Route>
         ) : (
           // Landing page for logged-out visitors

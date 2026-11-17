@@ -1,15 +1,18 @@
 // Sample-backed UI pages remain alongside the database-backed social features.
 import { useEffect, useRef, useState } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams, useOutletContext, useNavigate } from 'react-router-dom'
 import {
   Users, MapPin, Clock, FilePdf, Copy, Check, PaperPlaneRight, UploadSimple,
-  Heart, ChatCircle, SealCheck, CaretDown, Plus, X, Bell,
+  Heart, ChatCircle, SealCheck, CaretDown, Plus, X, Bell, ChartBar, ChatCenteredDots,
+  Question, CheckCircle, At, ShareFat,
 } from '@phosphor-icons/react'
 import { Avatar, PageHeader } from '../components/ui'
-import { ROLE_LABEL } from '../format'
+import { ROLE_LABEL, formatDisplayName, formatUserName, timeAgo } from '../format'
+import { PostActions } from '../Feed'
 import { apa, bibtex } from '../cite'
 import { FAQ } from '../sample'
 import { api, apiBlob } from '../api'
+import StoryHighlights from '../components/stories/StoryHighlights'
 
 function CopyButton({ text }) {
   const [done, setDone] = useState(false)
@@ -156,7 +159,7 @@ export function CommunityDetail({ user }) {
     </section>
     <section className="panel community-members"><h2>Members</h2><div className="community-member-list">{members.map((member) => <div className="community-member" key={member.user_id}><Avatar name={member.name} src={member.avatar_url} size="sm" /><span><strong>{member.name}</strong><small>{member.role}</small></span>{canManageMembers && member.role !== 'owner' && <button className="btn btn-ghost btn-sm" onClick={() => updateMemberRole(member, member.role === 'moderator' ? 'member' : 'moderator')}>{member.role === 'moderator' ? 'Remove moderator' : 'Make moderator'}</button>}</div>)}</div>{members.length === 100 && <p className="muted-sm">Showing the first 100 members.</p>}</section>
     {community.membership_role && <form className="panel form-panel community-post-form" onSubmit={post}><label htmlFor="community-post-body">Start a discussion</label><textarea id="community-post-body" rows={3} maxLength={5000} required value={body} onChange={(e) => setBody(e.target.value)} placeholder="Share a question, update, or collaboration idea…" /><button className="btn btn-primary" disabled={saving}>{saving ? 'Posting…' : 'Post to community'}</button></form>}
-    <h2 className="section-title">Discussions</h2>{posts.length ? <div className="stack">{posts.map((item) => <article className="panel researcher-post" key={item.id}><div className="search-post-author"><Avatar name={item.author_name} src={item.author_avatar_url} size="sm" /><strong>{item.author_name}</strong></div><time>{new Date(item.created_at).toLocaleString()}</time><p>{item.body}</p>{(String(item.user_id) === String(user.id) || canManage) && <button className="link-danger" onClick={() => removePost(item.id)}>Remove post</button>}</article>)}</div> : <div className="panel empty"><p>No discussions yet. Join to start the first one.</p></div>}
+    <h2 className="section-title">Discussions</h2>{posts.length ? <div className="stack">{posts.map((item) => <article className="panel researcher-post" key={item.id}><div className="search-post-author"><Avatar name={formatDisplayName(item.author_name || item)} src={item.author_avatar_url} size="sm" /><strong>{formatDisplayName(item.author_name || item)}</strong></div><time>{new Date(item.created_at).toLocaleString()}</time><p>{item.body}</p>{(String(item.user_id) === String(user.id) || canManage) && <button className="link-danger" onClick={() => removePost(item.id)}>Remove post</button>}</article>)}</div> : <div className="panel empty"><p>No discussions yet. Join to start the first one.</p></div>}
     <div className="paper-pagination"><button className="btn btn-ghost" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1}>Previous</button><span className="muted-sm">Page {page}</span><button className="btn btn-ghost" onClick={() => setPage((value) => value + 1)} disabled={!hasMore}>Next</button></div>
   </div>
 }
@@ -528,7 +531,7 @@ export function Messages({ user }) {
   )
 }
 
-const NOTIF_ICON = { paper_review: SealCheck, like: Heart, message: ChatCircle, comment: ChatCircle }
+const NOTIF_ICON = { paper_review: SealCheck, like: Heart, message: ChatCircle, comment: ChatCircle, story_poll_vote: ChartBar, story_question_response: ChatCenteredDots, story_question_answered: ChatCenteredDots, story_quiz_answer: CheckCircle, story_mention: At, story_reshare: ShareFat, story_reaction: Heart, story_reply: ChatCircle }
 
 export function Notifications() {
   const [items, setItems] = useState([])
@@ -553,7 +556,7 @@ export function Notifications() {
     try { await api('/notifications/read-all', { method: 'PUT' }); setItems((current) => current.map((item) => ({ ...item, read_at: item.read_at ?? new Date().toISOString() }))); window.dispatchEvent(new Event('snarp:unread-changed')) }
     catch (err) { setError(err.message) }
   }
-  const target = (item) => item.entity_type === 'conversation' ? `/messages?conversation=${item.entity_id}` : item.entity_type === 'paper' ? '/my-submissions' : '/'
+  const target = (item) => item.entity_type === 'conversation' ? `/messages?conversation=${item.entity_id}` : item.entity_type === 'paper' ? '/my-submissions' : item.entity_type === 'story' ? `/?story=${item.entity_id}` : '/'
   return (
     <div className="page">
       <PageHeader title="Notifications">
@@ -963,7 +966,7 @@ export function Moderation({ user }) {
     {queue === 'reports' && <div className="chips">{['pending', 'reviewed', 'dismissed'].map((status) => <button key={status} className={`chip ${reportStatus === status ? 'active' : ''}`} onClick={() => { setLoading(true); setPage(1); setReportStatus(status) }}>{status[0].toUpperCase() + status.slice(1)}</button>)}</div>}
     {error && <p className="alert" role="alert">{error}</p>}
     {queue === 'audit' && user.role === 'admin' ? <><div className="stack">{audit.map((entry) => <article className="panel audit-item" key={entry.id}><strong>{entry.action}</strong><span>{entry.actor_name ?? 'Deleted user'} · {entry.actor_role ?? 'unknown role'} · {new Date(entry.created_at).toLocaleString()}</span><small>{entry.target_type} {entry.target_id}</small></article>)}</div><div className="submit-actions"><button className="btn btn-ghost" onClick={() => setAuditPage((value) => Math.max(1, value - 1))} disabled={auditPage <= 1}>Previous</button><span className="muted-sm">Audit page {auditPage}</span><button className="btn btn-ghost" onClick={() => setAuditPage((value) => value + 1)} disabled={audit.length < 20}>Next</button></div></> : loading ? <p className="muted-sm">Loading {queue}…</p> : queue === 'reports' ? <div className="stack">
-      {reports.map((report) => <article className="panel mod-item" key={report.id}><div className="mod-info"><h3>Report #{report.id}: post by {report.post_author_name}</h3><p className="muted-sm">Reported by {report.reporter_name} · {new Date(report.created_at).toLocaleString()}</p><p><strong>Reason:</strong> {report.reason}</p><p>{report.post_body || '[Image post]'}</p>{report.image_id && <img className="report-image" src={`/api/images/${report.image_id}`} alt="Reported post" loading="lazy" />}<Link to={`/users/${report.post_author_id}`}>View author profile</Link></div>{report.status === 'pending' && <div className="mod-actions"><button className="btn btn-ghost" onClick={() => decideReport(report, 'dismissed')} disabled={saving}>Dismiss</button><button className="btn btn-secondary btn-sm" onClick={() => decideReport(report, 'reviewed')} disabled={saving}>Mark reviewed</button></div>}</article>)}
+      {reports.map((report) => <article className="panel mod-item" key={report.id}><div className="mod-info"><h3>Report #{report.id}: post by {formatDisplayName(report.post_author_name)}</h3><p className="muted-sm">Reported by {formatDisplayName(report.reporter_name)} · {new Date(report.created_at).toLocaleString()}</p><p><strong>Reason:</strong> {report.reason}</p><p>{report.post_body || '[Image post]'}</p>{report.image_id && <img className="report-image" src={`/api/images/${report.image_id}`} alt="Reported post" loading="lazy" />}<Link to={`/users/${report.post_author_id}`}>View author profile</Link></div>{report.status === 'pending' && <div className="mod-actions"><button className="btn btn-ghost" onClick={() => decideReport(report, 'dismissed')} disabled={saving}>Dismiss</button><button className="btn btn-secondary btn-sm" onClick={() => decideReport(report, 'reviewed')} disabled={saving}>Mark reviewed</button></div>}</article>)}
       {!reports.length && <div className="panel empty"><h3>No {reportStatus} reports</h3></div>}
     </div> : <div className="stack">
       {papers.map((paper) => <article key={paper.id} className="panel mod-item">
@@ -1229,7 +1232,7 @@ export function Search() {
       {eventError && <p className="alert" role="alert">{eventError}</p>}
       {total === 0 && !paperError && <div className="panel empty"><h3>Nothing found</h3><p>Try a different word, like a topic or an author.</p></div>}
       {users.length > 0 && <><h2 className="section-title">Researchers</h2><div className="card-grid">{users.map((person) => <Link key={person.id} to={`/users/${person.id}`} className="panel researcher-card"><Avatar name={person.name} src={person.avatar_url} /><span><strong>{person.name}</strong><small>{person.institution || person.department || ROLE_LABEL[person.role]}</small></span></Link>)}</div></>}
-      {posts.length > 0 && <><h2 className="section-title">Posts</h2><div className="stack">{posts.map((post) => <article className="panel researcher-post search-post" key={post.id}><Link to={`/users/${post.user_id}`} className="search-post-author"><Avatar name={post.author_name} src={post.author_avatar_url} size="sm" /><strong>{post.author_name}</strong></Link><time>{new Date(post.created_at).toLocaleDateString()}</time>{post.body && <p>{post.body}</p>}{post.image_id && <img src={`/api/images/${post.image_id}`} alt="" loading="lazy" />}<span className="muted-sm">{post.like_count} likes · {post.comment_count} comments</span></article>)}</div></>}
+      {posts.length > 0 && <><h2 className="section-title">Posts</h2><div className="stack">{posts.map((post) => <article className="panel researcher-post search-post" key={post.id}><Link to={`/users/${post.user_id}`} className="search-post-author"><Avatar name={formatDisplayName(post.author_name || post)} src={post.author_avatar_url} size="sm" /><strong>{formatDisplayName(post.author_name || post)}</strong></Link><time>{new Date(post.created_at).toLocaleDateString()}</time>{post.body && <p>{post.body}</p>}{post.image_id && <img src={`/api/images/${post.image_id}`} alt="" loading="lazy" />}<span className="muted-sm">{post.like_count} likes · {post.comment_count} comments</span></article>)}</div></>}
       {shownPapers.length > 0 && <><h2 className="section-title">Research papers</h2><div className="stack">{shownPapers.map((paper) => <PublishedPaperCard key={paper.id} paper={paper} />)}</div></>}
       {communities.length > 0 && <><h2 className="section-title">Communities</h2><div className="card-grid">{communities.map((community) => <CommunityCard key={community.id} community={community} onMembership={updateCommunityMembership} />)}</div></>}
       {events.length > 0 && <><h2 className="section-title">Events</h2><div className="stack">{events.map((event) => <EventCard key={event.id} event={event} onRegister={updateEventRegistration} />)}</div></>}
@@ -1238,7 +1241,87 @@ export function Search() {
   )
 }
 
-export function UserProfile() {
+export function UserProfile({ user: propUser }) {
+  const outlet = useOutletContext?.() || {}
+  const [currentUser, setCurrentUser] = useState(propUser || outlet.user || null)
+
+  useEffect(() => {
+    if (propUser) {
+      setCurrentUser(propUser)
+    } else if (outlet.user) {
+      setCurrentUser(outlet.user)
+    } else {
+      api('/auth/me').then(setCurrentUser).catch(() => {})
+    }
+  }, [propUser, outlet.user])
+  const navigate = useNavigate()
+  const [shareCopied, setShareCopied] = useState(false)
+  const [shareError, setShareError] = useState('')
+  const [messaging, setMessaging] = useState(false)
+  const [messageError, setMessageError] = useState('')
+
+  const shareProfile = async () => {
+    setShareError('')
+    const targetId = profile?.id || id
+    const url = `${location.origin}/users/${targetId}`
+    const displayName = formatDisplayName(profile?.name || profile)
+    const shareData = {
+      title: `${displayName} on SNARP`,
+      text: profile?.bio ? `${displayName}: ${profile.bio}` : `View ${displayName}'s research profile on SNARP`,
+      url,
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      try {
+        await navigator.share(shareData)
+        return
+      } catch (err) {
+        if (err?.name === 'AbortError') return
+      }
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(url)
+        setShareCopied(true)
+        setTimeout(() => setShareCopied(false), 2000)
+      } catch {
+        setShareError('Could not copy profile link')
+      }
+    } else {
+      setShareError('Sharing not supported on this device')
+    }
+  }
+
+  const messageUser = async () => {
+    const targetUserId = profile?.id || id
+    if (!targetUserId || messaging) return
+
+    const myId = currentUser?.id || currentUser?.user_id
+    if (myId && String(myId) === String(targetUserId)) {
+      setMessageError('You cannot message yourself')
+      return
+    }
+
+    setMessaging(true)
+    setMessageError('')
+    try {
+      const conv = await api('/messages/conversations', {
+        method: 'POST',
+        body: { userId: Number(targetUserId) },
+      })
+      if (conv?.id) {
+        navigate(`/messages?conversation=${conv.id}`)
+      } else {
+        setMessageError('Could not start conversation')
+      }
+    } catch (err) {
+      setMessageError(err?.message || 'Could not start conversation')
+    } finally {
+      setMessaging(false)
+    }
+  }
+
   const { id } = useParams()
   const [profileParams] = useSearchParams()
   const pinnedPost = profileParams.get('post')
@@ -1259,24 +1342,111 @@ export function UserProfile() {
     return () => clearTimeout(timer)
   }, [profile])
   if (result.id === id && result.error) return <div className="page"><p className="alert" role="alert">{result.error}</p><Link to="/">Back to feed</Link></div>
+  const updateProfilePost = (updatedPost) => {
+    setResult((prev) => {
+      if (!prev.profile) return prev
+      return {
+        ...prev,
+        profile: {
+          ...prev.profile,
+          posts: (prev.profile.posts || []).map((p) => (p.id === updatedPost.id ? { ...p, ...updatedPost } : p))
+        }
+      }
+    })
+  }
+
   if (!profile) return <div className="page"><div className="panel empty" aria-busy="true">Loading profile…</div></div>
+
+  const isOwner = Boolean(
+    (currentUser?.id || currentUser?.user_id) &&
+    (profile?.id || id) &&
+    String(currentUser?.id || currentUser?.user_id) === String(profile?.id || id)
+  )
 
   return (
     <div className="page">
-      <PageHeader title={profile.name} sub={ROLE_LABEL[profile.role] ?? 'Researcher'} />
+      <PageHeader title={formatDisplayName(profile.name || profile)} sub={ROLE_LABEL[profile.role] ?? 'Researcher'} />
       <section className="panel researcher-profile">
-        <Avatar name={profile.name} size="lg" src={profile.avatar_url} />
+        <Avatar name={formatDisplayName(profile.name || profile)} size="lg" src={profile.avatar_url} />
         <div className="researcher-details">
+          {isOwner && profile.email && (
+            <p className="profile-private-email" style={{ margin: '4px 0 8px 0', fontSize: '0.95rem' }}>
+              <strong>Email:</strong> <a href={`mailto:${profile.email}`}>{profile.email}</a>
+            </p>
+          )}
           {(profile.institution || profile.department) && <p>{[profile.department, profile.institution].filter(Boolean).join(' · ')}</p>}
           {profile.bio && <p>{profile.bio}</p>}
           {profile.research_interests?.length > 0 && <div className="tag-row">{profile.research_interests.map((tag) => <span className="tag tag-blue" key={tag}>{tag}</span>)}</div>}
           {profile.skills?.length > 0 && <div className="tag-row">{profile.skills.map((skill) => <span className="tag" key={skill}>{skill}</span>)}</div>}
           {profile.links?.map((item) => <a key={item.url} href={item.url} target="_blank" rel="noreferrer">{item.label}</a>)}
           <p className="muted-sm">{profile.post_count} post{profile.post_count === 1 ? '' : 's'} · Joined {new Date(profile.created_at).toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}</p>
+          {!isOwner && (
+            <div className="profile-actions" role="group" aria-label="Profile actions">
+              <button
+                type="button"
+                className="btn btn-secondary profile-share-btn"
+                onClick={shareProfile}
+                aria-label={shareCopied ? 'Profile link copied' : 'Share profile'}
+              >
+                <ShareFat size={16} /> {shareCopied ? 'Copied link!' : 'Share'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary profile-message-btn"
+                onClick={messageUser}
+                disabled={messaging}
+                aria-label={`Send message to ${formatDisplayName(profile.name || profile)}`}
+              >
+                <ChatCircle size={16} /> {messaging ? 'Opening…' : 'Message'}
+              </button>
+              {shareError && <span className="profile-action-error" role="alert">{shareError}</span>}
+              {messageError && <span className="profile-action-error" role="alert">{messageError}</span>}
+            </div>
+          )}
         </div>
       </section>
+      <StoryHighlights
+        profileUserId={profile.id || id}
+        isOwner={isOwner}
+        currentUser={currentUser}
+        user={profile}
+      />
       <h2 className="section-title">Posts</h2>
-      {profile.posts.length === 0 ? <div className="panel empty"><p>No posts yet.</p></div> : <div className="stack">{profile.posts.map((post) => <article id={`post-${post.id}`} className="panel researcher-post" key={post.id}><time>{new Date(post.created_at).toLocaleDateString()}</time>{post.body && <p>{post.body}</p>}{post.image_id && <img src={`/api/images/${post.image_id}`} alt="" loading="lazy" />}<span className="muted-sm">{post.like_count} likes · {post.comment_count} comments</span></article>)}</div>}
+      {profile.posts.length === 0 ? (
+        <div className="panel empty"><p>No posts yet.</p></div>
+      ) : (
+        <div className="stack">
+          {profile.posts.map((post) => (
+            <article id={`post-${post.id}`} className="panel researcher-post" key={post.id}>
+              <div className="search-post-author" style={{ marginBottom: '8px' }}>
+                <Avatar name={formatDisplayName(post.author_name || profile.name)} src={post.author_avatar_url || profile.avatar_url} size="sm" />
+                <div>
+                  <strong>{formatDisplayName(post.author_name || profile.name)}</strong>
+                  <time style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-3)' }}>
+                    {timeAgo(post.created_at)}
+                  </time>
+                </div>
+              </div>
+              {post.body && <p className="post-body">{post.body}</p>}
+              {post.image_id && (
+                <img
+                  className="post-image"
+                  src={`/api/images/${post.image_id}`}
+                  alt=""
+                  loading="lazy"
+                  style={{ maxHeight: '400px', width: 'auto', borderRadius: 'var(--radius)', marginTop: '8px', marginBottom: '8px' }}
+                />
+              )}
+              <PostActions
+                post={{ ...post, user_id: post.user_id || profile.id }}
+                viewerId={currentUser?.id || currentUser?.user_id}
+                onUpdate={updateProfilePost}
+                onLogout={() => { location.href = '/login' }}
+              />
+            </article>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

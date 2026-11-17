@@ -14,6 +14,8 @@ import { validateCommunity, validateCommunityPost } from './community.js'
 import { validateMessageBody, validateRecipientId } from './messaging.js'
 import { validateEvent } from './event.js'
 import { rateLimit } from 'express-rate-limit'
+import { createStoryRouter } from './stories/routes.js'
+import { cleanupExpiredStories } from './stories/cleanup.js'
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
@@ -140,13 +142,24 @@ const loginLimiter = rateLimit({
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } })
 const paperUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PDF_BYTES, files: 1 } })
+const storyUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024, files: 1 } })
 
 const publicUser = ({
   id, name, email, role, created_at, profile_image_id,
   institution = '', department = '', research_interests = [], bio = '', skills = [], links = [],
 }) => ({
   id,
-  name,
+  name: (typeof name === 'string' && name.trim() && !name.includes('@'))
+    ? name.trim()
+    : (typeof email === 'string' && email.includes('@'))
+      ? email.split('@')[0].trim()
+      : (name || 'User'),
+  full_name: (typeof name === 'string' && name.trim() && !name.includes('@'))
+    ? name.trim()
+    : null,
+  username: (typeof email === 'string' && email.includes('@'))
+    ? email.split('@')[0].trim()
+    : (name || 'User'),
   email,
   role,
   created_at,
@@ -491,7 +504,17 @@ app.get('/api/users/search', auth, async (req, res) => {
   if (!q) return res.json([])
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(
-    `SELECT u.id, u.name, u.role, u.profile_image_id,
+    `SELECT u.id,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+      END AS name,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE NULL
+      END AS full_name,
+      split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+      u.role, u.profile_image_id,
       COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department
      FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id
      WHERE u.name ILIKE $1 OR up.institution ILIKE $1 OR up.department ILIKE $1
@@ -508,7 +531,17 @@ app.get('/api/users/search', auth, async (req, res) => {
 app.get('/api/users/:id', auth, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'User not found' })
   const { rows } = await pool.query(
-    `SELECT u.id, u.name, u.role, u.created_at, u.profile_image_id,
+    `SELECT u.id,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+      END AS name,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE NULL
+      END AS full_name,
+      split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+      u.role, u.created_at, u.profile_image_id, u.email,
       COALESCE(up.institution, '') AS institution, COALESCE(up.department, '') AS department,
       COALESCE(up.research_interests, '{}') AS research_interests, COALESCE(up.bio, '') AS bio,
       COALESCE(up.skills, '{}') AS skills, COALESCE(up.links, '[]'::jsonb) AS links,
@@ -520,11 +553,22 @@ app.get('/api/users/:id', auth, async (req, res) => {
   const user = rows[0]
   const pinnedPostId = isPgId(req.query.post) ? req.query.post : null
   const posts = await pool.query(
-    `SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at,
+    `SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+      END AS author_name,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE NULL
+      END AS full_name,
+      split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+      u.role AS author_role,
+      CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
       (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
       EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
       (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count
-     FROM posts p WHERE p.user_id = $1 AND (
+     FROM posts p JOIN users u ON u.id = p.user_id WHERE p.user_id = $1 AND (
        $3::integer IS NULL OR p.id = $3 OR p.id IN (
          SELECT recent.id FROM posts recent WHERE recent.user_id = $1
          ORDER BY recent.created_at DESC, recent.id DESC LIMIT 20
@@ -533,9 +577,11 @@ app.get('/api/users/:id', auth, async (req, res) => {
      ORDER BY CASE WHEN p.id = $3 THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC LIMIT 20`,
     [user.id, req.userId, pinnedPostId]
   )
-  const { profile_image_id, ...publicProfile } = user
+  const isOwner = Number(req.userId) === Number(user.id)
+  const { profile_image_id, email, ...publicProfile } = user
   res.json({
     ...publicProfile,
+    ...(isOwner && email ? { email } : {}),
     avatar_url: profile_image_id ? `/api/images/${profile_image_id}` : null,
     posts: posts.rows,
   })
@@ -588,7 +634,17 @@ app.put('/api/auth/me/photo', auth, upload.single('photo'), async (req, res) => 
 })
 
 const POST_SELECT = `
-  SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id, u.name AS author_name, u.role AS author_role,
+  SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id,
+    CASE
+      WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+      ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+    END AS author_name,
+    CASE
+      WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+      ELSE NULL
+    END AS full_name,
+    split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+    u.role AS author_role,
     CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
     (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
     EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
@@ -827,7 +883,16 @@ app.get('/api/notifications', auth, async (req, res) => {
   const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 30))
   const [{ rows }, countResult] = await Promise.all([
     pool.query(`SELECT n.id, n.kind, n.entity_type, n.entity_id, n.text, n.created_at, n.read_at,
-        actor.id AS actor_id, actor.name AS actor_name
+        actor.id AS actor_id,
+        CASE
+          WHEN actor.name NOT LIKE '%@%' AND trim(actor.name) <> '' THEN trim(actor.name)
+          ELSE split_part(COALESCE(NULLIF(trim(actor.name), ''), actor.email), '@', 1)
+        END AS actor_name,
+        CASE
+          WHEN actor.name NOT LIKE '%@%' AND trim(actor.name) <> '' THEN trim(actor.name)
+          ELSE NULL
+        END AS actor_full_name,
+        split_part(COALESCE(NULLIF(trim(actor.name), ''), actor.email), '@', 1) AS actor_username
       FROM notifications n LEFT JOIN users actor ON actor.id = n.actor_id
       WHERE n.user_id = $1 ORDER BY n.created_at DESC, n.id DESC LIMIT $2 OFFSET $3`,
     [req.userId, limit, (page - 1) * limit]),
@@ -884,7 +949,18 @@ app.get('/api/posts/search', auth, async (req, res) => {
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
   const { rows } = await pool.query(
     `SELECT p.id, p.body, p.image_id, p.created_at, p.updated_at, p.user_id,
-      u.name AS author_name, u.role AS author_role,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+      END AS author_name,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE NULL
+      END AS full_name,
+      split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+      u.role AS author_role,
+      CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
+      -- identity fields derived above
       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url,
       (SELECT count(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
       EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $2) AS liked_by_me,
@@ -971,7 +1047,11 @@ app.put('/api/posts/:id/like', auth, async (req, res) => {
         INSERT INTO likes (post_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING post_id, user_id
       ), notified AS (
         INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
-        SELECT p.user_id, inserted.user_id, 'like', 'post', p.id, actor.name || ' liked your post'
+        SELECT p.user_id, inserted.user_id, 'like', 'post', p.id,
+          CASE
+            WHEN actor.name NOT LIKE '%@%' AND trim(actor.name) <> '' THEN trim(actor.name)
+            ELSE split_part(actor.email, '@', 1)
+          END || ' liked your post'
         FROM inserted JOIN posts p ON p.id = inserted.post_id JOIN users actor ON actor.id = inserted.user_id
         WHERE p.user_id <> inserted.user_id RETURNING id
       ) SELECT post_id FROM inserted`, [req.params.id, req.userId])
@@ -987,12 +1067,50 @@ app.put('/api/posts/:id/like', auth, async (req, res) => {
   res.json(rows[0])
 })
 
+app.get('/api/posts/:id/likes', auth, async (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
+  const post = await pool.query('SELECT 1 FROM posts WHERE id = $1', [req.params.id])
+  if (!post.rows[0]) return res.status(404).json({ error: 'Post not found' })
+  const { rows } = await pool.query(
+    `SELECT l.post_id, l.user_id, l.created_at,
+       CASE
+         WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+         ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+       END AS author_name,
+       CASE
+         WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+         ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+       END AS name,
+       CASE
+         WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+         ELSE NULL
+       END AS full_name,
+       split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+       u.role,
+       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url
+     FROM likes l JOIN users u ON u.id = l.user_id
+     WHERE l.post_id = $1
+     ORDER BY l.created_at DESC`,
+    [req.params.id]
+  )
+  res.json(rows)
+})
+
 app.get('/api/posts/:id/comments', auth, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
   const { rows } = await pool.query(
     `SELECT * FROM (
        SELECT c.id, c.post_id, c.user_id, c.body, c.created_at, c.updated_at,
-         u.name AS author_name, u.role AS author_role,
+         CASE
+           WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+           ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+         END AS author_name,
+         CASE
+           WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+           ELSE NULL
+         END AS full_name,
+         split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+         u.role AS author_role,
          CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url
        FROM comments c JOIN users u ON u.id = c.user_id
        WHERE c.post_id = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 50
@@ -1012,14 +1130,28 @@ app.post('/api/posts/:id/comments', auth, async (req, res) => {
       RETURNING id, post_id, user_id
     ), notified AS (
       INSERT INTO notifications (user_id, actor_id, kind, entity_type, entity_id, text)
-      SELECT p.user_id, inserted.user_id, 'comment', 'post', p.id, actor.name || ' commented on your post'
+      SELECT p.user_id, inserted.user_id, 'comment', 'post', p.id,
+        CASE
+          WHEN actor.name NOT LIKE '%@%' AND trim(actor.name) <> '' THEN trim(actor.name)
+          ELSE split_part(actor.email, '@', 1)
+        END || ' commented on your post'
       FROM inserted JOIN posts p ON p.id = inserted.post_id JOIN users actor ON actor.id = inserted.user_id
       WHERE p.user_id <> inserted.user_id RETURNING id
     ) SELECT id FROM inserted`, [req.params.id, req.userId, body])
   if (!rows[0]) return res.status(404).json({ error: 'Post not found' })
   const comment = await pool.query(
     `SELECT c.id, c.post_id, c.user_id, c.body, c.created_at, c.updated_at,
-      u.name AS author_name, u.role AS author_role,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1)
+      END AS author_name,
+      CASE
+        WHEN u.name NOT LIKE '%@%' AND trim(u.name) <> '' THEN trim(u.name)
+        ELSE NULL
+      END AS full_name,
+      split_part(COALESCE(NULLIF(trim(u.name), ''), u.email), '@', 1) AS username,
+      u.role AS author_role,
+      -- identity fields derived above
       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS author_avatar_url
      FROM comments c JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
     [rows[0].id]
@@ -1331,6 +1463,8 @@ app.get('/api/images/:id', async (req, res) => {
   res.send(rows[0].data)
 })
 
+app.use('/api/stories', createStoryRouter({ pool, auth, isPgId, upload: storyUpload }))
+
 app.get('/api/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1')
@@ -1345,9 +1479,9 @@ app.get('/api/health', async (_req, res) => {
 app.use((err, req, res, _next) => {
   if (err instanceof multer.MulterError) {
     const error = err.code === 'LIMIT_FILE_SIZE'
-      ? (err.field === 'pdf' ? `PDF must be ${Math.floor(MAX_PDF_BYTES / 1024 / 1024)} MB or smaller` : 'Image must be 5 MB or smaller')
+      ? (err.field === 'pdf' ? `PDF must be ${Math.floor(MAX_PDF_BYTES / 1024 / 1024)} MB or smaller` : err.field === 'media' ? 'Media must be 15 MB or smaller' : 'Image must be 5 MB or smaller')
       : err.message
-    return res.status(400).json({ error, ...(err.field === 'pdf' ? { field: 'pdf' } : {}) })
+    return res.status(400).json({ error, ...(err.field === 'pdf' || err.field === 'media' ? { field: err.field } : {}) })
   }
   log('error', 'request_failed', {
     method: req.method,
@@ -1359,11 +1493,14 @@ app.use((err, req, res, _next) => {
 })
 
 const server = app.listen(PORT, () => log('info', 'api_listening', { port: PORT, poolMax: PG_POOL_MAX }))
+const storyCleanupInterval = setInterval(() => cleanupExpiredStories(pool), 60 * 60 * 1000)
+storyCleanupInterval.unref()
 let shuttingDown = false
 const shutdown = (signal) => {
   if (shuttingDown) return
   shuttingDown = true
   log('info', 'shutdown_started', { signal })
+  clearInterval(storyCleanupInterval)
   const timeout = setTimeout(() => {
     log('error', 'shutdown_timeout')
     server.closeAllConnections?.()

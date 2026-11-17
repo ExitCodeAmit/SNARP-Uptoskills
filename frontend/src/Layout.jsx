@@ -87,11 +87,12 @@ export default function Layout({ user, onLogout }) {
         </div>
 
         <div className="sidebar-user">
-          <Avatar name={user.name} src={user.avatar_url} />
+          <Link to={`/users/${user?.id || user?.user_id}`} onClick={close} style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, minWidth: 0, textDecoration: 'none', color: 'inherit' }} title="View your profile"><Avatar name={user.name} src={user.avatar_url} />
           <div className="sidebar-user-info">
             <strong>{user.name}</strong>
             <span>{ROLE_LABEL[user.role]}</span>
           </div>
+          </Link>
           <button className="icon-btn" onClick={onLogout} aria-label="Sign out" title="Sign out">
             <SignOut size={20} />
           </button>
@@ -129,7 +130,7 @@ export default function Layout({ user, onLogout }) {
         </header>
 
         <div className="content">
-          <Outlet />
+          <Outlet context={{ user }} />
         </div>
       </div>
     </div>

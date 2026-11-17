@@ -1,9 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { Trash, PencilSimple, Image as ImageIcon, X, ThumbsUp, ChatCircle, ShareFat, FilePdf } from '@phosphor-icons/react'
 import { api, apiBlob } from './api'
 import { Avatar } from './components/ui'
-import { ROLE_LABEL, timeAgo } from './format'
+import { ROLE_LABEL, timeAgo, formatDisplayName, formatUserName } from './format'
+import StoriesTray from './components/stories/StoriesTray'
+import StoryViewerModal from './components/stories/StoryViewerModal'
+import StoryComposer from './components/stories/StoryComposer'
 
 const MAX = 5000
 const MAX_IMAGE = 5 * 1024 * 1024
@@ -29,15 +32,19 @@ function FeedPaper({ paper }) {
   </>
 }
 
-function PostActions({ post, viewerId, onUpdate, onLogout }) {
+export function PostActions({ post, viewerId, onUpdate, onLogout }) {
   const [commentsOpen, setCommentsOpen] = useState(false)
   const [comments, setComments] = useState([])
   const [draft, setDraft] = useState('')
+  const [likesOpen, setLikesOpen] = useState(false)
+  const [likes, setLikes] = useState([])
+  const [loadingLikes, setLoadingLikes] = useState(false)
   const [reportOpen, setReportOpen] = useState(false)
   const [reportReason, setReportReason] = useState('')
   const [reportSent, setReportSent] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [postShareCopied, setPostShareCopied] = useState(false)
 
   const handleError = (err) => {
     if (err.status === 401) onLogout()
@@ -54,11 +61,31 @@ function PostActions({ post, viewerId, onUpdate, onLogout }) {
     }
   }
 
+  const toggleLikes = async () => {
+    const opening = !likesOpen
+    setLikesOpen(opening)
+    setError('')
+    if (opening) {
+      setLoadingLikes(true)
+      try {
+        setLikes(await api(`/posts/${post.id}/likes`))
+      } catch (err) {
+        handleError(err)
+      } finally {
+        setLoadingLikes(false)
+      }
+    }
+  }
+
   const toggleLike = async () => {
     setBusy(true)
     setError('')
     try {
-      onUpdate({ ...post, ...await api(`/posts/${post.id}/like`, { method: 'PUT', body: { liked: !post.liked_by_me } }) })
+      const updated = await api(`/posts/${post.id}/like`, { method: 'PUT', body: { liked: !post.liked_by_me } })
+      onUpdate({ ...post, ...updated })
+      if (likesOpen) {
+        setLikes(await api(`/posts/${post.id}/likes`).catch(() => likes))
+      }
     } catch (err) { handleError(err) }
     finally { setBusy(false) }
   }
@@ -88,11 +115,30 @@ function PostActions({ post, viewerId, onUpdate, onLogout }) {
   const share = async () => {
     const url = `${location.origin}/users/${post.user_id}?post=${post.id}#post-${post.id}`
     try {
-      if (navigator.share) await navigator.share({ title: 'SNARP post', text: post.body, url })
-      else await navigator.clipboard.writeText(url)
-      setError('')
+      if (typeof navigator !== 'undefined' && navigator.share) {
+        await navigator.share({ title: 'SNARP post', text: post.body, url })
+        setError('')
+      } else if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url)
+        setPostShareCopied(true)
+        setTimeout(() => setPostShareCopied(false), 2000)
+        setError('')
+      } else {
+        setError('Sharing not supported on this device')
+      }
     } catch (err) {
-      if (err.name !== 'AbortError') setError('Could not share this post')
+      if (err.name !== 'AbortError') {
+        if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+          try {
+            await navigator.clipboard.writeText(url)
+            setPostShareCopied(true)
+            setTimeout(() => setPostShareCopied(false), 2000)
+            setError('')
+            return
+          } catch {}
+        }
+        setError('Could not share this post')
+      }
     }
   }
 
@@ -112,17 +158,41 @@ function PostActions({ post, viewerId, onUpdate, onLogout }) {
     <>
     <div className="post-actions">
       <button className={post.liked_by_me ? 'active' : ''} onClick={toggleLike} aria-pressed={!!post.liked_by_me} disabled={busy}>
-        <ThumbsUp size={18} weight={post.liked_by_me ? 'fill' : 'regular'} /> {post.like_count ?? 0} Like
+        <ThumbsUp size={18} weight={post.liked_by_me ? 'fill' : 'regular'} /> {post.liked_by_me ? 'Liked' : 'Like'}
       </button>
-      <button onClick={toggleComments}><ChatCircle size={18} /> {post.comment_count ?? 0} Comment</button>
-      <button onClick={share}><ShareFat size={18} /> Share</button>
+      <button className={`post-count-btn ${likesOpen ? 'active' : ''}`} onClick={toggleLikes} aria-label="View users who liked this post">
+        {post.like_count ?? 0} {post.like_count === 1 ? 'Like' : 'Likes'}
+      </button>
+      <button className={`post-comments-btn ${commentsOpen ? 'active' : ''}`} onClick={toggleComments}><ChatCircle size={18} /> {post.comment_count ?? 0} {post.comment_count === 1 ? 'Comment' : 'Comments'}</button>
+      <button onClick={share} aria-label={postShareCopied ? 'Post link copied' : 'Share post'}><ShareFat size={18} /> {postShareCopied ? 'Copied!' : 'Share'}</button>
       {String(post.user_id) !== String(viewerId) && <button onClick={() => setReportOpen(!reportOpen)} disabled={reportSent}>{reportSent ? 'Reported' : 'Report'}</button>}
     </div>
     {error && <p className="field-error" role="alert">{error}</p>}
+    {likesOpen && <section className="likes-panel" aria-label="Likes">
+      <div className="likes-panel-header">
+        <strong>Liked by ({likes.length})</strong>
+        <button className="link-muted btn-close-likes" type="button" onClick={() => setLikesOpen(false)}>Close</button>
+      </div>
+      {loadingLikes && <p className="muted-sm">Loading likes…</p>}
+      {!loadingLikes && likes.length === 0 && <p className="muted-sm">No likes yet.</p>}
+      {!loadingLikes && likes.map((likeUser) => (
+        <div className="like-row" key={likeUser.user_id}>
+          <Avatar name={formatDisplayName(likeUser)} src={likeUser.avatar_url} size="sm" />
+          <div className="like-user-info">
+            <Link to={`/users/${likeUser.user_id}`} className="like-user-name">
+              <strong>{formatDisplayName(likeUser)}</strong>
+            </Link>
+            {likeUser.role && likeUser.role !== 'user' && (
+              <span className="tag tag-sm">{ROLE_LABEL[likeUser.role] || likeUser.role}</span>
+            )}
+          </div>
+        </div>
+      ))}
+    </section>}
     {commentsOpen && <section className="comments-panel" aria-label="Comments">
       {comments.map((comment) => <div className="comment-row" key={comment.id}>
-        <Avatar name={comment.author_name} src={comment.author_avatar_url} size="sm" />
-        <div><strong>{comment.author_name}</strong><p>{comment.body}</p></div>
+        <Avatar name={formatDisplayName(comment.author_name || comment)} src={comment.author_avatar_url} size="sm" />
+        <div><strong>{formatDisplayName(comment.author_name || comment)}</strong><p>{comment.body}</p></div>
         {String(comment.user_id) === String(viewerId) && <button className="link-danger" onClick={() => deleteComment(comment)}>Delete</button>}
       </div>)}
       {comments.length === 0 && <p className="muted-sm">No comments yet.</p>}
@@ -161,6 +231,112 @@ export default function Feed({ user, onLogout }) {
   const [editBody, setEditBody] = useState('')
   const [editError, setEditError] = useState('')
   const fileRef = useRef(null)
+  const [activeStoryViewer, setActiveStoryViewer] = useState(null)
+  const [storiesRefreshKey, setStoriesRefreshKey] = useState(0)
+  const [composerOpen, setComposerOpen] = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const storyParam = searchParams.get('story')
+  const handledStoryParamRef = useRef(null)
+
+  const handleOpenStoryView = (payload) => {
+    if (!payload) return
+    const targetUser = payload.user || me
+    const rawStories = Array.isArray(payload.stories)
+      ? payload.stories
+      : (Array.isArray(payload) ? payload : [])
+
+    if (rawStories.length === 0) return
+
+    const unviewedIdx = rawStories.findIndex((s) => !s.viewed)
+    const initialIndex = typeof payload.initialIndex === 'number'
+      ? payload.initialIndex
+      : (unviewedIdx >= 0 ? unviewedIdx : 0)
+
+    setActiveStoryViewer({
+      user: targetUser,
+      stories: rawStories,
+      initialIndex,
+    })
+  }
+
+  const handleCloseStoryViewer = () => {
+    setActiveStoryViewer(null)
+    if (searchParams.has('story')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('story')
+      setSearchParams(next, { replace: true })
+    }
+  }
+
+  // Open story viewer if navigated with ?story=:id from a notification
+  useEffect(() => {
+    if (!storyParam || handledStoryParamRef.current === storyParam) return
+    handledStoryParamRef.current = storyParam
+
+    api(`/stories/${storyParam}`)
+      .then((res) => {
+        if (res?.stories && res.stories.length > 0) {
+          handleOpenStoryView({
+            user: res.user || me,
+            stories: res.stories,
+            initialIndex: res.initialIndex ?? 0,
+          })
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not open story from notification parameter:', err?.message)
+      })
+  }, [storyParam, me])
+
+  const handleStoryDeleted = (deletedId) => {
+    setStoriesRefreshKey((k) => k + 1)
+    setActiveStoryViewer((prev) => {
+      if (!prev) return null
+      const remaining = (prev.stories || []).filter((s) => s.id !== deletedId)
+      if (remaining.length === 0) return null
+      return {
+        ...prev,
+        stories: remaining,
+      }
+    })
+  }
+
+  const handleOpenStoryCreate = () => {
+    setComposerOpen(true)
+  }
+
+  /**
+   * Called by StoryComposer after a successful POST /api/stories.
+   * Refreshes the StoriesTray and opens the new story in the viewer.
+   */
+  const handleStoryCreated = (story) => {
+    setComposerOpen(false)
+    // Refresh the tray to include the newly created story
+    setStoriesRefreshKey((k) => k + 1)
+    // Open the new story immediately in the viewer
+    if (story && story.id) {
+      setActiveStoryViewer({
+        user: me,
+        stories: [story],
+        initialIndex: 0,
+      })
+    }
+  }
+
+  /**
+   * Called by StoryViewerModal after a successful POST /api/stories/:id/reshare.
+   * Refreshes the StoriesTray and opens the newly reshared story.
+   */
+  const handleStoryReshared = (newStory) => {
+    setStoriesRefreshKey((k) => k + 1)
+    if (newStory && newStory.id) {
+      setActiveStoryViewer({
+        user: me,
+        stories: [newStory],
+        initialIndex: 0,
+      })
+    }
+  }
 
   // Any 401 means the token expired or was revoked
   const handle = (setError) => (err) => (err.status === 401 ? onLogout() : setError(err.message))
@@ -258,6 +434,13 @@ export default function Feed({ user, onLogout }) {
           <p>Share what you are working on with the community.</p>
         </div>
 
+        <StoriesTray
+          currentUser={me}
+          onOpenView={handleOpenStoryView}
+          onOpenCreate={handleOpenStoryCreate}
+          refreshKey={storiesRefreshKey}
+        />
+
         <form className="composer panel" onSubmit={submit}>
           <Avatar name={me.name} src={me.avatar_url} />
           <div className="composer-main">
@@ -324,10 +507,10 @@ export default function Feed({ user, onLogout }) {
           {posts.map((p) => (
               <li key={`${p.type ?? 'post'}-${p.id}`} className={`panel post ${p.type === 'paper' ? 'paper-feed-item' : ''}`}>
                 {p.type === 'paper' ? <FeedPaper paper={p} /> : <>
-                <Avatar name={p.author_name} src={p.author_avatar_url} />
+                <Avatar name={formatDisplayName(p.author_name || p)} src={p.author_avatar_url} />
                 <div className="post-main">
                   <div className="post-head">
-                    <Link to={`/users/${p.user_id}`} className="post-author"><strong>{p.author_name}</strong></Link>
+                    <Link to={`/users/${p.user_id}`} className="post-author"><strong>{formatDisplayName(p.author_name || p)}</strong></Link>
                     {p.author_role !== 'user' && <span className="tag tag-teal">{ROLE_LABEL[p.author_role]}</span>}
                     <time dateTime={p.created_at} title={new Date(p.created_at).toLocaleString()}>
                       {timeAgo(p.created_at)}
@@ -355,7 +538,7 @@ export default function Feed({ user, onLogout }) {
                     <img
                       className="post-image"
                       src={`/api/images/${p.image_id}`}
-                      alt={p.body ? '' : `Image posted by ${p.author_name}`}
+                      alt={p.body ? '' : `Image posted by ${formatDisplayName(p.author_name || p)}`}
                       loading="lazy"
                     />
                   )}
@@ -372,9 +555,9 @@ export default function Feed({ user, onLogout }) {
       <aside className="rail">
         <section className="panel profile">
           <div className="profile-cover" />
-          <Avatar name={me.name} size="lg" src={me.avatar_url} />
-          <h2 className="profile-name">{me.name}</h2>
-          <p className="profile-email">{me.email}</p>
+          <Avatar name={formatDisplayName(me.name || me)} size="lg" src={me.avatar_url} />
+          <h2 className="profile-name">{formatDisplayName(me.name || me)}</h2>
+          <p className="profile-email">@{formatUserName(me)}</p>
           <dl className="profile-stats">
             <div>
               <dd>{me.post_count ?? '-'}</dd>
@@ -426,6 +609,26 @@ export default function Feed({ user, onLogout }) {
           ))}
         </section>
       </aside>
+
+      {activeStoryViewer && (
+        <StoryViewerModal
+          currentUser={me}
+          user={activeStoryViewer.user}
+          stories={activeStoryViewer.stories}
+          initialIndex={activeStoryViewer.initialIndex ?? 0}
+          onClose={handleCloseStoryViewer}
+          onStoryDeleted={handleStoryDeleted}
+          onStoryReshared={handleStoryReshared}
+        />
+      )}
+
+      {composerOpen && (
+        <StoryComposer
+          currentUser={me}
+          onClose={() => setComposerOpen(false)}
+          onCreated={handleStoryCreated}
+        />
+      )}
     </div>
   )
 }

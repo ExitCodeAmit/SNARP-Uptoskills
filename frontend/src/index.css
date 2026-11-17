@@ -1953,3 +1953,108 @@ button {
   .comment-form { flex-wrap: wrap; }
   .comment-form input { flex-basis: 100%; }
 }
+
+/* Post Likes and Comments Enhancements */
+.post-actions button.post-count-btn,
+.post-actions button.post-comments-btn {
+  font-weight: 500;
+}
+
+.post-actions button.post-count-btn:hover,
+.post-actions button.post-comments-btn:hover {
+  color: var(--orange-ink);
+}
+
+.post-actions button.post-count-btn.active,
+.post-actions button.post-comments-btn.active {
+  color: var(--orange-ink);
+  background: var(--raised);
+  font-weight: 600;
+}
+
+.likes-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 12px;
+  background: var(--raised);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.likes-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.btn-close-likes {
+  font-size: 0.8rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-3);
+  padding: 2px 6px;
+  border-radius: var(--radius);
+}
+
+.btn-close-likes:hover {
+  color: var(--text);
+}
+
+.like-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.like-user-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.like-user-name {
+  color: var(--text);
+  font-size: 0.88rem;
+  text-decoration: none;
+}
+
+.like-user-name:hover {
+  color: var(--orange-ink);
+  text-decoration: underline;
+}
+
+/* Profile Visitor Actions */
+.profile-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.profile-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.profile-action-error {
+  font-size: 0.82rem;
+  color: var(--danger, #dc2626);
+  width: 100%;
+  margin-top: 2px;
+}
