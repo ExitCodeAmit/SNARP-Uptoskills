@@ -645,6 +645,7 @@ export function Submit({ user }) {
   const [file, setFile] = useState(null)
   const [errors, setErrors] = useState({})
   const [serverError, setServerError] = useState('')
+  const [duplicateError, setDuplicateError] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [submitted, setSubmitted] = useState(null)
   const fileInputRef = useRef(null)
@@ -654,6 +655,7 @@ export function Submit({ user }) {
     setForm((current) => ({ ...current, [name]: value }))
     setErrors((current) => ({ ...current, [name]: undefined }))
     setServerError('')
+    setDuplicateError(false)
     requestKeyRef.current = null
   }
 
@@ -664,6 +666,7 @@ export function Submit({ user }) {
     }))
     setErrors((current) => ({ ...current, authors: undefined }))
     setServerError('')
+    setDuplicateError(false)
     requestKeyRef.current = null
   }
 
@@ -671,6 +674,7 @@ export function Submit({ user }) {
     setFile(nextFile)
     setErrors((current) => ({ ...current, pdf: undefined }))
     setServerError('')
+    setDuplicateError(false)
     requestKeyRef.current = null
     if (nextFile && nextFile.size > MAX_PDF_BYTES) {
       setErrors((current) => ({ ...current, pdf: 'PDF must be 10 MB or smaller' }))
@@ -737,8 +741,13 @@ export function Submit({ user }) {
       if (fileInputRef.current) fileInputRef.current.value = ''
       requestKeyRef.current = null
     } catch (error) {
-      if (error.field) setErrors((current) => ({ ...current, [error.field]: error.message }))
-      else setServerError(error.message)
+      if (error.status === 409 && error.code === 'DUPLICATE_PAPER') {
+        setDuplicateError(true)
+      } else if (error.field) {
+        setErrors((current) => ({ ...current, [error.field]: error.message }))
+      } else {
+        setServerError(error.message)
+      }
     } finally {
       setSubmitting(false)
     }
@@ -748,6 +757,7 @@ export function Submit({ user }) {
     setSubmitted(null)
     setErrors({})
     setServerError('')
+    setDuplicateError(false)
   }
 
   return (
@@ -765,7 +775,16 @@ export function Submit({ user }) {
         </section>
       ) : (
         <form className="panel form-panel paper-form" onSubmit={submit} noValidate>
-          {serverError && <p className="alert" role="alert">{serverError}</p>}
+          {duplicateError ? (
+            <div className="alert" role="alert">
+              <strong>Duplicate Research Paper Detected</strong>
+              <p style={{ margin: '0.25rem 0 0' }}>
+                This research paper has already been submitted to SNARP. Duplicate submissions are not allowed. Please check your document and submit a different research paper.
+              </p>
+            </div>
+          ) : serverError ? (
+            <p className="alert" role="alert">{serverError}</p>
+          ) : null}
 
           <div className="field">
             <label htmlFor="p-title">Paper title <span aria-hidden="true">*</span></label>

@@ -14,6 +14,7 @@ import { validateCommunity, validateCommunityPost } from './community.js'
 import { validateMessageBody, validateRecipientId } from './messaging.js'
 import { validateEvent } from './event.js'
 import { rateLimit } from 'express-rate-limit'
+import { fileHash, contentHash, extractPdfText, normalizeDoi, checkDuplicate } from './dedup.js'
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
@@ -1069,42 +1070,85 @@ app.post('/api/papers/submit', auth, requireAuthor, paperUpload.single('pdf'), a
     throw err
   }
 
-  const inserted = await pool.query(
-    `INSERT INTO papers
-       (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
-        pdf_content_type, pdf_size, additional_notes, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12)
-     ON CONFLICT (user_id, idempotency_key) DO NOTHING
-     RETURNING id, title, status, created_at`,
-    [
-      req.userId,
-      paper.title,
-      paper.abstract,
-      paper.doi,
-      paper.domain,
-      paper.tags,
-      JSON.stringify(paper.authors),
-      paper.pdfData,
-      paper.filename,
-      paper.pdfSize,
-      paper.additionalNotes,
-      idempotencyKey,
-    ]
-  )
-
-  let result = inserted.rows[0]
-  let statusCode = 201
-  if (!result && idempotencyKey) {
-    const existing = await pool.query(
-      'SELECT id, title, status, created_at FROM papers WHERE user_id = $1 AND idempotency_key = $2',
-      [req.userId, idempotencyKey]
-    )
-    result = existing.rows[0]
-    statusCode = 200
+  // --- Duplicate detection ---
+  const fHash = fileHash(paper.pdfData)
+  let cHash = null
+  try {
+    const rawText = await extractPdfText(paper.pdfData)
+    cHash = contentHash(rawText)
+  } catch (extractionErr) {
+    return res.status(400).json({
+      error: 'The uploaded PDF is corrupted, password-protected, or unreadable.',
+      field: 'pdf',
+    })
   }
-  if (!result) throw new Error('Paper submission could not be confirmed')
+  const normalizedDoi = normalizeDoi(paper.doi)
 
-  res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
+  // Pre-insert duplicate check (catches most cases before INSERT)
+  const dupCheck = await checkDuplicate(pool, { fileHash: fHash, contentHash: cHash, doi: normalizedDoi })
+  if (dupCheck.isDuplicate) {
+    return res.status(409).json({
+      success: false,
+      code: 'DUPLICATE_PAPER',
+      message: 'This research paper has already been submitted to SNARP.',
+    })
+  }
+
+  // Insert with fingerprints; unique indexes catch concurrent duplicates
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO papers
+         (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
+          pdf_content_type, pdf_size, additional_notes, idempotency_key, file_hash, content_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13, $14)
+       ON CONFLICT (user_id, idempotency_key) DO NOTHING
+       RETURNING id, title, status, created_at`,
+      [
+        req.userId,
+        paper.title,
+        paper.abstract,
+        paper.doi,
+        paper.domain,
+        paper.tags,
+        JSON.stringify(paper.authors),
+        paper.pdfData,
+        paper.filename,
+        paper.pdfSize,
+        paper.additionalNotes,
+        idempotencyKey,
+        fHash,
+        cHash,
+      ]
+    )
+
+    let result = inserted.rows[0]
+    let statusCode = 201
+    if (!result && idempotencyKey) {
+      const existing = await pool.query(
+        'SELECT id, title, status, created_at FROM papers WHERE user_id = $1 AND idempotency_key = $2',
+        [req.userId, idempotencyKey]
+      )
+      result = existing.rows[0]
+      statusCode = 200
+    }
+    if (!result) throw new Error('Paper submission could not be confirmed')
+
+    res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
+  } catch (err) {
+    // Unique constraint violation on file_hash, content_hash, or doi = concurrent duplicate
+    if (err.code === '23505' && (
+      err.constraint === 'papers_file_hash_uniq' ||
+      err.constraint === 'papers_content_hash_uniq' ||
+      err.constraint === 'papers_doi_uniq'
+    )) {
+      return res.status(409).json({
+        success: false,
+        code: 'DUPLICATE_PAPER',
+        message: 'This research paper has already been submitted to SNARP.',
+      })
+    }
+    throw err
+  }
 })
 
 app.get('/api/papers/my-submissions', auth, async (req, res) => {

@@ -25,9 +25,11 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
   if (res.status === 204) return null
   const data = await res.json().catch(() => null)
   if (!res.ok) {
-    const err = new Error(data?.error || 'Could not reach the server. Is the backend running?')
+    const err = new Error(data?.error || data?.message || 'Could not reach the server. Is the backend running?')
     err.status = res.status
     err.field = data?.field
+    err.code = data?.code
+    err.data = data
     throw err
   }
   return data
