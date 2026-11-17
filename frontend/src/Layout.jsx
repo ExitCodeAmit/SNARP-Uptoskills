@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
+  House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes, Trophy,
   UploadSimple, ShieldCheck, GearSix, Question, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
 import { Avatar } from './components/ui'
@@ -11,6 +11,7 @@ import logo from './assets/logo.png'
 
 const MAIN_NAV = [
   { to: '/', label: 'Feed', icon: House, end: true },
+  { to: '/leaderboard', label: 'Leaderboard', icon: Trophy },
   { to: '/communities', label: 'Communities', icon: UsersThree },
   { to: '/articles', label: 'Research papers', icon: Article },
   { to: '/events', label: 'Events', icon: CalendarBlank },

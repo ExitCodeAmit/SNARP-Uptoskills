@@ -10,6 +10,7 @@ import { api, getToken, saveToken, clearToken } from './api'
 import Auth from './Auth'
 import Layout from './Layout'
 import Feed from './Feed'
+import Leaderboard from './Leaderboard'
 
 import {
   Communities,
@@ -88,6 +89,7 @@ export default function App() {
               path="/"
               element={<Feed user={user} onLogout={logout} />}
             />
+            <Route path="/leaderboard" element={<Leaderboard />} />
 
             <Route path="/communities" element={<Communities />} />
             <Route path="/articles" element={<Articles />} />
