@@ -60,6 +60,42 @@ async function setupDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS posts_created_at_idx ON posts (created_at DESC);
+    
+-- Store post likes
+CREATE TABLE IF NOT EXISTS post_likes (
+  id SERIAL PRIMARY KEY,
+  post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (post_id, user_id)
+);
+ALTER TABLE post_likes
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE INDEX IF NOT EXISTS post_likes_created_at_idx
+ON post_likes (created_at DESC);
+
+-- Store answers
+CREATE TABLE IF NOT EXISTS answers (
+  id SERIAL PRIMARY KEY,
+  post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  is_best BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  marked_best_at TIMESTAMPTZ
+);
+ALTER TABLE answers
+ADD COLUMN IF NOT EXISTS marked_best_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS answers_created_at_idx
+ON answers (created_at DESC);
+
+-- One best answer per post
+CREATE UNIQUE INDEX IF NOT EXISTS one_best_answer_per_post
+ON answers (post_id)
+WHERE is_best = true;
+
+  
     -- Upgrades posts tables created before image support
     ALTER TABLE posts ADD COLUMN IF NOT EXISTS image_id UUID REFERENCES images(id) ON DELETE SET NULL;
     ALTER TABLE posts DROP CONSTRAINT IF EXISTS posts_body_check;
@@ -183,16 +219,24 @@ app.get('/api/posts', auth, async (req, res) => {
     SELECT * FROM (
       SELECT 'post'::text AS type, p.id::text AS id, p.body, p.image_id::text AS image_id,
         p.created_at, p.user_id, u.name AS author_name, u.role AS author_role,
+        (SELECT COUNT(*)::int FROM post_likes l
+ WHERE l.post_id = p.id) AS likes_count,
+EXISTS (
+  SELECT 1 FROM post_likes l
+  WHERE l.post_id = p.id AND l.user_id = $1
+) AS liked_by_me,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
         NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi
       FROM posts p JOIN users u ON u.id = p.user_id
       UNION ALL
       SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
         COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.user_id, u.name AS author_name, u.role AS author_role,
+        NULL::int AS likes_count,
+FALSE AS liked_by_me,
         rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
       FROM papers rp JOIN users u ON u.id = rp.user_id
       WHERE rp.status = 'approved'
-    ) feed ORDER BY created_at DESC LIMIT 50`)
+    ) feed ORDER BY created_at DESC LIMIT 50`, [req.userId])
   res.json(rows)
 })
 
@@ -227,6 +271,212 @@ app.post('/api/posts', auth, upload.single('image'), async (req, res) => {
   const created = await pool.query(`${POST_SELECT} WHERE p.id = $1`, [rows[0].id])
   res.status(201).json(created.rows[0])
 })
+
+// Like a post
+app.post('/api/posts/:id/like', auth, async (req, res) => {
+  const postId = Number(req.params.id)
+
+  if (!Number.isInteger(postId) || postId <= 0) {
+    return res.status(400).json({ error: 'Invalid post ID' })
+  }
+
+  const post = await pool.query(
+    'SELECT id FROM posts WHERE id = $1',
+    [postId]
+  )
+
+  if (!post.rows.length) {
+    return res.status(404).json({ error: 'Post not found' })
+  }
+
+  await pool.query(
+    `INSERT INTO post_likes (post_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (post_id, user_id) DO NOTHING`,
+    [postId, req.userId]
+  )
+
+  const result = await pool.query(
+    'SELECT COUNT(*)::int AS likes FROM post_likes WHERE post_id = $1',
+    [postId]
+  )
+
+  res.json({
+    liked: true,
+    likes: result.rows[0].likes
+  })
+})
+
+// Unlike a post
+app.delete('/api/posts/:id/like', auth, async (req, res) => {
+  const postId = Number(req.params.id)
+
+  if (!Number.isInteger(postId) || postId <= 0) {
+    return res.status(400).json({ error: 'Invalid post ID' })
+  }
+
+  await pool.query(
+    'DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2',
+    [postId, req.userId]
+  )
+
+  const result = await pool.query(
+    'SELECT COUNT(*)::int AS likes FROM post_likes WHERE post_id = $1',
+    [postId]
+  )
+
+  res.json({
+    liked: false,
+    likes: result.rows[0].likes
+  })
+})
+
+// Get all answers for a post
+app.get('/api/posts/:id/answers', auth, async (req, res) => {
+  const postId = Number(req.params.id)
+
+  if (!Number.isInteger(postId) || postId <= 0) {
+    return res.status(400).json({ error: 'Invalid post ID' })
+  }
+
+  const post = await pool.query(
+    'SELECT id FROM posts WHERE id = $1',
+    [postId]
+  )
+
+  if (!post.rows.length) {
+    return res.status(404).json({ error: 'Post not found' })
+  }
+
+  const { rows } = await pool.query(`
+    SELECT
+      a.id,
+      a.post_id,
+      a.user_id,
+      a.body,
+      a.is_best,
+      a.created_at,
+      a.marked_best_at,
+      u.name AS author_name,
+      u.role AS author_role
+    FROM answers a
+    JOIN users u ON u.id = a.user_id
+    WHERE a.post_id = $1
+    ORDER BY a.is_best DESC, a.created_at ASC
+  `, [postId])
+
+  res.json({ answers: rows })
+})
+
+
+// Submit an answer to a post
+app.post('/api/posts/:id/answers', auth, async (req, res) => {
+  const postId = Number(req.params.id)
+  const body = typeof req.body?.body === 'string'
+    ? req.body.body.trim()
+    : ''
+
+  if (!Number.isInteger(postId) || postId <= 0) {
+    return res.status(400).json({ error: 'Invalid post ID' })
+  }
+
+  if (!body) {
+    return res.status(400).json({ error: 'Answer cannot be empty' })
+  }
+
+  if (body.length > 5000) {
+    return res.status(400).json({ error: 'Answer must be under 5000 characters' })
+  }
+
+  const post = await pool.query(
+    'SELECT id FROM posts WHERE id = $1',
+    [postId]
+  )
+
+  if (!post.rows.length) {
+    return res.status(404).json({ error: 'Post not found' })
+  }
+
+  const { rows } = await pool.query(`
+    INSERT INTO answers (post_id, user_id, body)
+    VALUES ($1, $2, $3)
+    RETURNING id, post_id, user_id, body, is_best, created_at, marked_best_at
+  `, [postId, req.userId, body])
+
+  const answer = await pool.query(`
+    SELECT a.*, u.name AS author_name, u.role AS author_role
+    FROM answers a
+    JOIN users u ON u.id = a.user_id
+    WHERE a.id = $1
+  `, [rows[0].id])
+
+  res.status(201).json(answer.rows[0])
+})
+
+
+// Mark an answer as the best answer
+app.patch('/api/answers/:id/best', auth, async (req, res) => {
+  const answerId = Number(req.params.id)
+
+  if (!Number.isInteger(answerId) || answerId <= 0) {
+    return res.status(400).json({ error: 'Invalid answer ID' })
+  }
+
+  const client = await pool.connect()
+
+  try {
+    await client.query('BEGIN')
+
+    const answerResult = await client.query(`
+      SELECT a.id, a.post_id, p.user_id AS post_owner
+      FROM answers a
+      JOIN posts p ON p.id = a.post_id
+      WHERE a.id = $1
+      FOR UPDATE OF p
+    `, [answerId])
+
+    if (!answerResult.rows.length) {
+      await client.query('ROLLBACK')
+      return res.status(404).json({ error: 'Answer not found' })
+    }
+
+    const answer = answerResult.rows[0]
+
+    if (String(answer.post_owner) !== String(req.userId)) {
+      await client.query('ROLLBACK')
+      return res.status(403).json({
+        error: 'Only the post owner can select the best answer'
+      })
+    }
+
+    await client.query(`
+      UPDATE answers
+      SET is_best = false, marked_best_at = NULL
+      WHERE post_id = $1 AND is_best = true
+    `, [answer.post_id])
+
+    const { rows } = await client.query(`
+      UPDATE answers
+      SET is_best = true, marked_best_at = now()
+      WHERE id = $1
+      RETURNING id, post_id, user_id, body, is_best, created_at, marked_best_at
+    `, [answerId])
+
+    await client.query('COMMIT')
+
+    res.json({
+      message: 'Best answer selected successfully',
+      answer: rows[0]
+    })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+
 
 app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res) => {
   const idempotencyKey = req.get('Idempotency-Key') || null
@@ -404,6 +654,185 @@ app.get('/api/images/:id', async (req, res) => {
   res.set({ 'Content-Type': rows[0].mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'X-Content-Type-Options': 'nosniff' })
   res.send(rows[0].data)
 })
+
+
+// Weekly leaderboard API
+app.get('/api/leaderboard', auth, async (req, res) => {
+  const { rows } = await pool.query(`
+    WITH week AS (
+      SELECT date_trunc(
+        'week',
+        now() AT TIME ZONE 'Asia/Kolkata'
+      ) AT TIME ZONE 'Asia/Kolkata' AS start_at
+    ),
+    post_scores AS (
+      SELECT p.user_id, COUNT(*)::int AS posts
+      FROM posts p CROSS JOIN week w
+      WHERE p.created_at >= w.start_at
+      GROUP BY p.user_id
+    ),
+    like_scores AS (
+      SELECT p.user_id, COUNT(*)::int AS likes_received
+      FROM post_likes l
+      JOIN posts p ON p.id = l.post_id
+      CROSS JOIN week w
+      WHERE l.created_at >= w.start_at
+      GROUP BY p.user_id
+    ),
+    best_scores AS (
+      SELECT a.user_id, COUNT(*)::int AS best_answers
+      FROM answers a CROSS JOIN week w
+      WHERE a.is_best = true
+        AND a.marked_best_at >= w.start_at
+      GROUP BY a.user_id
+    ),
+    paper_scores AS (
+      SELECT rp.user_id, COUNT(*)::int AS research_papers
+      FROM papers rp CROSS JOIN week w
+      WHERE rp.status = 'approved'
+        AND rp.reviewed_at >= w.start_at
+      GROUP BY rp.user_id
+    ),
+    totals AS (
+      SELECT
+        u.id,
+        u.name,
+        COALESCE(ps.posts, 0) AS posts,
+        COALESCE(ls.likes_received, 0) AS likes_received,
+        COALESCE(bs.best_answers, 0) AS best_answers,
+        COALESCE(rs.research_papers, 0) AS research_papers,
+        (
+          COALESCE(ps.posts, 0) * 3 +
+          COALESCE(ls.likes_received, 0) +
+          COALESCE(bs.best_answers, 0) * 5 +
+          COALESCE(rs.research_papers, 0) * 5
+        ) AS score
+      FROM users u
+      LEFT JOIN post_scores ps ON ps.user_id = u.id
+      LEFT JOIN like_scores ls ON ls.user_id = u.id
+      LEFT JOIN best_scores bs ON bs.user_id = u.id
+      LEFT JOIN paper_scores rs ON rs.user_id = u.id
+    )
+    SELECT
+      ROW_NUMBER() OVER (
+        ORDER BY score DESC, best_answers DESC,
+        likes_received DESC, posts DESC,
+        research_papers DESC, name ASC
+      )::int AS rank,
+      id, name, posts, likes_received, best_answers,
+      research_papers, score
+    FROM totals
+    WHERE score > 0
+    ORDER BY rank
+    LIMIT 50
+  `)
+
+  res.json({
+    leaderboard: rows,
+    weekStartsOn: 'Monday',
+    points: {
+      post: 3,
+      like: 1,
+      bestAnswer: 5,
+      researchPaper: 5
+    }
+  })
+})
+
+// Monthly leaderboard API
+app.get('/api/leaderboard/monthly', auth, async (req, res) => {
+  const { rows } = await pool.query(`
+    WITH month AS (
+      SELECT date_trunc(
+        'month',
+        now() AT TIME ZONE 'Asia/Kolkata'
+      ) AT TIME ZONE 'Asia/Kolkata' AS start_at
+    ),
+
+    post_scores AS (
+      SELECT p.user_id, COUNT(*)::int AS posts
+      FROM posts p CROSS JOIN month m
+      WHERE p.created_at >= m.start_at
+      GROUP BY p.user_id
+    ),
+
+    like_scores AS (
+      SELECT p.user_id, COUNT(*)::int AS likes_received
+      FROM post_likes l
+      JOIN posts p ON p.id = l.post_id
+      CROSS JOIN month m
+      WHERE l.created_at >= m.start_at
+      GROUP BY p.user_id
+    ),
+
+    best_scores AS (
+      SELECT a.user_id, COUNT(*)::int AS best_answers
+      FROM answers a CROSS JOIN month m
+      WHERE a.is_best = true
+        AND a.marked_best_at >= m.start_at
+      GROUP BY a.user_id
+    ),
+
+    paper_scores AS (
+      SELECT rp.user_id, COUNT(*)::int AS research_papers
+      FROM papers rp CROSS JOIN month m
+      WHERE rp.status = 'approved'
+        AND rp.reviewed_at >= m.start_at
+      GROUP BY rp.user_id
+    ),
+
+    totals AS (
+      SELECT
+        u.id,
+        u.name,
+        COALESCE(ps.posts, 0) AS posts,
+        COALESCE(ls.likes_received, 0) AS likes_received,
+        COALESCE(bs.best_answers, 0) AS best_answers,
+        COALESCE(rs.research_papers, 0) AS research_papers,
+
+        (
+          COALESCE(ps.posts, 0) * 3 +
+          COALESCE(ls.likes_received, 0) +
+          COALESCE(bs.best_answers, 0) * 5 +
+          COALESCE(rs.research_papers, 0) * 5
+        ) AS score
+
+      FROM users u
+      LEFT JOIN post_scores ps ON ps.user_id = u.id
+      LEFT JOIN like_scores ls ON ls.user_id = u.id
+      LEFT JOIN best_scores bs ON bs.user_id = u.id
+      LEFT JOIN paper_scores rs ON rs.user_id = u.id
+    )
+
+    SELECT
+      ROW_NUMBER() OVER (
+        ORDER BY score DESC, best_answers DESC,
+        likes_received DESC, posts DESC,
+        research_papers DESC, name ASC
+      )::int AS rank,
+
+      id, name, posts, likes_received,
+      best_answers, research_papers, score
+
+    FROM totals
+    WHERE score > 0
+    ORDER BY rank
+    LIMIT 50
+  `)
+
+  res.json({
+    leaderboard: rows,
+    period: 'monthly',
+    monthStartsOn: 1,
+    points: {
+      post: 3,
+      like: 1,
+      bestAnswer: 5,
+      researchPaper: 5
+    }
+  })
+})
+
 
 // Express only treats 4-arg middleware as an error handler
 // eslint-disable-next-line no-unused-vars

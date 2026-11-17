@@ -30,31 +30,194 @@ function FeedPaper({ paper }) {
   </>
 }
 
-// ponytail: like/comment/share are UI only; like toggles locally and is not saved
-function PostActions() {
-  const [liked, setLiked] = useState(false)
+function PostActions({ post, onLogout, currentUserId }) {
+  const [liked, setLiked] = useState(Boolean(post.liked_by_me))
+  const [likes, setLikes] = useState(Number(post.likes_count ?? 0))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [answers, setAnswers] = useState([])
+const [showAnswers, setShowAnswers] = useState(false)
+const [answerText, setAnswerText] = useState('')
+const [answerLoading, setAnswerLoading] = useState(false)
+const [answerError, setAnswerError] = useState('')
+const [bestLoading, setBestLoading] = useState(false)
+
+const loadAnswers = async () => {
+  setAnswerLoading(true)
+  setAnswerError('')
+
+  try {
+    const result = await api(`/posts/${post.id}/answers`)
+    setAnswers(Array.isArray(result) ? result : result.answers || [])
+    setShowAnswers(true)
+  } catch (err) {
+    if (err.status === 401) {
+      onLogout()
+    } else {
+      setAnswerError(err.message || 'Could not load answers')
+    }
+  } finally {
+    setAnswerLoading(false)
+  }
+}
+const submitAnswer = async (e) => {
+  e.preventDefault()
+
+  if (!answerText.trim() || answerLoading) return
+
+  setAnswerLoading(true)
+  setAnswerError('')
+
+  try {
+    const result = await api(`/posts/${post.id}/answers`, {
+      method: 'POST',
+      body: { body: answerText.trim() }
+    })
+
+    setAnswers((prev) => [...prev, result])
+    setAnswerText('')
+  } catch (err) {
+    if (err.status === 401) {
+      onLogout()
+    } else {
+      setAnswerError(err.message || 'Could not submit answer')
+    }
+  } finally {
+    setAnswerLoading(false)
+  }
+}
+const markBestAnswer = async (answerId) => {
+  if (bestLoading) return
+
+  setBestLoading(true)
+  setAnswerError('')
+
+  try {
+    await api(`/answers/${answerId}/best`, {
+      method: 'PATCH'
+    })
+
+    setAnswers((prev) =>
+      prev.map((answer) => ({
+        ...answer,
+        is_best: String(answer.id) === String(answerId)
+      }))
+    )
+  } catch (err) {
+    if (err.status === 401) {
+      onLogout()
+    } else {
+      setAnswerError(err.message || 'Could not mark best answer')
+    }
+  } finally {
+    setBestLoading(false)
+  }
+}
+  const toggleLike = async () => {
+    if (busy) return
+
+    setBusy(true)
+    setError('')
+
+    try {
+      const result = await api(`/posts/${post.id}/like`, {
+        method: liked ? 'DELETE' : 'POST'
+      })
+
+      setLiked(result.liked)
+      setLikes(result.likes)
+    } catch (err) {
+      if (err.status === 401) {
+        onLogout()
+      } else {
+        setError(err.message || 'Could not update like')
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="post-actions">
-      <button className={liked ? 'active' : ''} onClick={() => setLiked(!liked)} aria-pressed={liked}>
-        <ThumbsUp size={18} weight={liked ? 'fill' : 'regular'} /> Like
+      <button
+        className={liked ? 'active' : ''}
+        onClick={toggleLike}
+        disabled={busy}
+        aria-pressed={liked}
+      >
+        <ThumbsUp size={18} weight={liked ? 'fill' : 'regular'} />
+        Like ({likes})
       </button>
-      <button><ChatCircle size={18} /> Comment</button>
+
+      {error && <p className="field-error">{error}</p>}
+
+      <button
+  onClick={() => showAnswers ? setShowAnswers(false) : loadAnswers()}
+  disabled={answerLoading}
+>
+  <ChatCircle size={18} />
+  {showAnswers ? 'Hide Answers' : 'Answer'}
+</button>
+      {showAnswers && (
+        <div className="answers-section">
+          {answers.map((answer) => (
+            <div key={answer.id} className="answer-item">
+              <strong>{answer.author_name}</strong>
+
+              {answer.is_best ? (
+  <span className="tag tag-teal">Best answer</span>
+) : String(post.user_id) === String(currentUserId) ? (
+  <button
+    type="button"
+    onClick={() => markBestAnswer(answer.id)}
+    disabled={bestLoading}
+  >
+    {bestLoading ? 'Please wait...' : 'Mark as Best Answer'}
+  </button>
+) : null}
+
+<p>{answer.body}</p>
+            </div>
+          ))}
+
+          {answerError && (
+            <p className="field-error">{answerError}</p>
+          )}
+
+          <form onSubmit={submitAnswer}>
+            <textarea
+              value={answerText}
+              onChange={(e) => setAnswerText(e.target.value)}
+              maxLength={5000}
+              placeholder="Write your answer..."
+            />
+
+            <button
+              type="submit"
+              disabled={!answerText.trim() || answerLoading}
+            >
+              {answerLoading ? 'Please wait...' : 'Submit Answer'}
+            </button>
+          </form>
+        </div>
+      )}
       <button><ShareFat size={18} /> Share</button>
     </div>
   )
 }
-
-export default function Feed({ user, onLogout }) {
-  const [me, setMe] = useState(user)
+// Parent Feed component starts here
+export default function Feed({ onLogout }) {
   const [posts, setPosts] = useState([])
+  const [me, setMe] = useState(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [body, setBody] = useState('')
-  const [image, setImage] = useState(null) // { file, url } for the preview
+  const [image, setImage] = useState(null)
   const [posting, setPosting] = useState(false)
   const [postError, setPostError] = useState('')
   const [confirmId, setConfirmId] = useState(null)
   const fileRef = useRef(null)
+
 
   // Any 401 means the token expired or was revoked
   const handle = (setError) => (err) => (err.status === 401 ? onLogout() : setError(err.message))
@@ -117,7 +280,9 @@ export default function Feed({ user, onLogout }) {
     }
     setConfirmId(null)
   }
-
+  if (loading) {
+    return <div className="panel">Loading feed...</div>
+  }
   return (
     <div className="feed-layout">
       <main className="feed">
@@ -221,7 +386,11 @@ export default function Feed({ user, onLogout }) {
                       loading="lazy"
                     />
                   )}
-                  <PostActions />
+                  <PostActions
+  post={p}
+  onLogout={onLogout}
+  currentUserId={me.id}
+/>
                 </div>
                 </>}
               </li>
