@@ -19,8 +19,9 @@ const MAIN_NAV = [
   { to: '/tools', label: 'Citation tools', icon: Quotes },
 ]
 
-const WORK_NAV = [
-  { to: '/submit', label: 'Submit a paper', icon: UploadSimple },
+const CAN_SUBMIT_ROLES = ['author', 'admin', 'moderator']
+
+const BASE_WORK_NAV = [
   { to: '/my-submissions', label: 'My submissions', icon: Article },
   { to: '/settings', label: 'Settings', icon: GearSix },
   { to: '/help', label: 'Help center', icon: Question },
@@ -48,6 +49,10 @@ export default function Layout({ user, onLogout }) {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const close = () => setOpen(false)
+  const canSubmit = CAN_SUBMIT_ROLES.includes(user.role)
+  const workNav = canSubmit
+    ? [{ to: '/submit', label: 'Submit a paper', icon: UploadSimple }, ...BASE_WORK_NAV]
+    : BASE_WORK_NAV
 
   useEffect(() => {
     let active = true
@@ -82,7 +87,7 @@ export default function Layout({ user, onLogout }) {
 
         <div className="sidebar-scroll">
           <NavGroup title="Discover" items={navItems} onNavigate={close} />
-          <NavGroup title="Workspace" items={WORK_NAV} onNavigate={close} />
+          <NavGroup title="Workspace" items={workNav} onNavigate={close} />
           {['admin', 'moderator'].includes(user.role) && <NavGroup title="Review" items={[{ to: '/moderation', label: 'Paper moderation', icon: ShieldCheck }]} onNavigate={close} />}
         </div>
 
@@ -119,7 +124,7 @@ export default function Layout({ user, onLogout }) {
               <Bell size={22} />
               {unread.notifications > 0 && <span className="nav-badge topbar-badge">{unread.notifications}</span>}
             </NavLink>
-            {pathname !== '/submit' && (
+            {canSubmit && pathname !== '/submit' && (
               <Link to="/submit" className="btn btn-primary">
                 <Plus size={18} weight="bold" />
                 <span>Submit paper</span>

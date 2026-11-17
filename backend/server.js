@@ -198,7 +198,9 @@ async function auth(req, res, next) {
 }
 
 function requireAuthor(req, res, next) {
-  if (req.userRole !== 'author') return res.status(403).json({ error: 'Author access required' })
+  if (!['author', 'admin', 'moderator'].includes(req.userRole)) {
+    return res.status(403).json({ error: 'Author access required' })
+  }
   next()
 }
 

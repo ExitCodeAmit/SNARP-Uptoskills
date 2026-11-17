@@ -651,6 +651,24 @@ export function Submit({ user }) {
   const fileInputRef = useRef(null)
   const requestKeyRef = useRef(null)
 
+  // Only author, admin, and moderator can submit papers
+  if (!['author', 'admin', 'moderator'].includes(user?.role)) {
+    return (
+      <div className="page">
+        <PageHeader title="Submit a paper" sub="Moderators review every submission before it is published." />
+        <section className="panel" style={{ textAlign: 'center', padding: '2.5rem 1.5rem' }}>
+          <h2 style={{ marginBottom: '0.5rem' }}>Author account required</h2>
+          <p style={{ color: 'var(--muted)', maxWidth: '34rem', margin: '0 auto 1.5rem' }}>
+            Only users with an <strong>Author</strong> account can submit research papers.
+            If you want to publish your work, please create a new account and choose
+            &ldquo;Publish research&rdquo; during sign-up.
+          </p>
+          <Link to="/articles" className="btn btn-ghost">Browse research papers</Link>
+        </section>
+      </div>
+    )
+  }
+
   const update = (name, value) => {
     setForm((current) => ({ ...current, [name]: value }))
     setErrors((current) => ({ ...current, [name]: undefined }))
