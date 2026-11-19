@@ -925,6 +925,53 @@ app.get('/api/users/friends', auth, async (req, res) => {
   res.json(rows)
 })
 
+// Leaderboard (PR #18): points for posts (+3), likes received (+1), comments on other people's posts (+1)
+// and published papers (+5) since the start of the week (Monday) or month, in India time.
+const leaderboard = (unit) => async (_req, res) => {
+  const { rows } = await pool.query(
+    `WITH period AS (
+       SELECT date_trunc($1, now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata' AS start_at
+     ),
+     post_scores AS (
+       SELECT p.user_id, count(*)::int AS posts FROM posts p, period WHERE p.created_at >= period.start_at GROUP BY p.user_id
+     ),
+     like_scores AS (
+       SELECT p.user_id, count(*)::int AS likes_received
+       FROM likes l JOIN posts p ON p.id = l.post_id, period
+       WHERE l.created_at >= period.start_at AND l.user_id <> p.user_id GROUP BY p.user_id
+     ),
+     comment_scores AS (
+       SELECT c.user_id, count(*)::int AS comments
+       FROM comments c JOIN posts p ON p.id = c.post_id, period
+       WHERE c.created_at >= period.start_at AND c.user_id <> p.user_id GROUP BY c.user_id
+     ),
+     paper_scores AS (
+       SELECT p.user_id, count(*)::int AS research_papers
+       FROM papers p, period WHERE p.status = 'published' AND p.published_at >= period.start_at GROUP BY p.user_id
+     ),
+     totals AS (
+       SELECT u.id, u.name,
+         CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
+         COALESCE(ps.posts, 0) AS posts, COALESCE(ls.likes_received, 0) AS likes_received,
+         COALESCE(cs.comments, 0) AS comments, COALESCE(rs.research_papers, 0) AS research_papers,
+         COALESCE(ps.posts, 0) * 3 + COALESCE(ls.likes_received, 0) + COALESCE(cs.comments, 0) + COALESCE(rs.research_papers, 0) * 5 AS score
+       FROM users u
+       LEFT JOIN post_scores ps ON ps.user_id = u.id
+       LEFT JOIN like_scores ls ON ls.user_id = u.id
+       LEFT JOIN comment_scores cs ON cs.user_id = u.id
+       LEFT JOIN paper_scores rs ON rs.user_id = u.id
+       WHERE u.blocked_at IS NULL
+     )
+     SELECT row_number() OVER (ORDER BY score DESC, research_papers DESC, likes_received DESC, posts DESC, name ASC)::int AS rank,
+       id, name, avatar_url, posts, likes_received, comments, research_papers, score
+     FROM totals WHERE score > 0 ORDER BY rank LIMIT 50`,
+    [unit],
+  )
+  res.json({ period: unit === 'week' ? 'weekly' : 'monthly', leaderboard: rows })
+}
+app.get('/api/leaderboard', auth, leaderboard('week'))
+app.get('/api/leaderboard/monthly', auth, leaderboard('month'))
+
 app.get('/api/users/suggestions', auth, async (req, res) => {
   const { rows } = await pool.query(
     `WITH me AS (SELECT COALESCE(research_interests, '{}') AS interests FROM user_profiles WHERE user_id = $1)

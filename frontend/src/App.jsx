@@ -18,6 +18,7 @@ import Layout from './Layout'
 import Feed from './Feed'
 import Reels from './Reels'
 import CitationNetwork from './CitationNetwork'
+import Leaderboard from './Leaderboard'
 
 import {
   Communities,
@@ -159,6 +160,7 @@ function SiteApp() {
             <Route path="/moderation" element={<Navigate to="/moderator" replace />} />
             <Route path="/moderator" element={['admin', 'moderator'].includes(user.role) ? <ModeratorDashboard /> : <AccessDenied title="Moderator dashboard" text="This area is only for moderators and the Super Admin." />} />
             <Route path="/citation-network" element={<CitationNetwork />} />
+            <Route path="/leaderboard" element={<Leaderboard />} />
             <Route path="/my-submissions" element={<MySubmissions />} />
             <Route path="/my-submissions/:id" element={<SubmissionFeedback user={user} />} />
             <Route path="/reviews" element={<ReviewQueue />} />
