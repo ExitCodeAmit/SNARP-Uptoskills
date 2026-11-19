@@ -34,6 +34,9 @@ import { attachCollaborationWebSocket, createCollaborationServer, flushCollabora
 import { createDocumentsRouter } from './documents.js'
 import { extractPdfText as extractProfilePdfText } from './pdfExtractor.js'
 import { generateWithGemini } from './gemini.js'
+import { buildSessionAnswerMessages, buildStandaloneQueryMessages, normalizeChatTitle, parseChatQuestion } from './chatSession.js'
+import { buildPaperAnswerMessages, canAccessPaperForChat } from './paperChat.js'
+import { completeChat, indexPaper, indexPendingPapers, searchExcerpts } from './paper-chat.js'
 import { createMailer, createVerificationToken, hashToken, isTokenShape, passwordResetEmail, RESET_TTL_MINUTES, VERIFICATION_TTL_HOURS, verificationEmail } from './mailer.js'
 import { fileHash, contentHash, extractPdfText, normalizeDoi, checkDuplicate } from './dedup.js'
 
@@ -1509,6 +1512,116 @@ app.get('/api/researchers/:id/profile', auth, async (req, res) => {
 
   res.json(rows[0])
 })
+
+// Paper chat (PR #19): saved chat sessions that answer only from passages of published papers.
+// Every query is scoped to the signed-in user's own sessions.
+const CHAT_SESSION_COLUMNS = `s.id, s.title, s.paper_id, p.title AS paper_title, s.created_at, s.updated_at`
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `paper-chat:${req.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: 'You are asking very quickly. Please wait a minute and try again.' }),
+})
+const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value))
+const ownSession = async (sessionId, userId) => (isUuid(sessionId)
+  ? (await pool.query(`SELECT ${CHAT_SESSION_COLUMNS} FROM chat_sessions s LEFT JOIN papers p ON p.id = s.paper_id WHERE s.id = $1 AND s.user_id = $2`, [sessionId, userId])).rows[0]
+  : null)
+
+app.get('/api/chat/sessions', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT ${CHAT_SESSION_COLUMNS} FROM chat_sessions s LEFT JOIN papers p ON p.id = s.paper_id
+     WHERE s.user_id = $1 ORDER BY s.updated_at DESC LIMIT 100`,
+    [req.userId],
+  )
+  res.json(rows)
+})
+
+app.post('/api/chat/sessions', auth, writeLimiter, async (req, res) => {
+  let paperId = null
+  if (req.body?.paperId != null) {
+    if (!isPgBigId(String(req.body.paperId))) return res.status(400).json({ error: 'paperId must be a valid paper ID.' })
+    const { rows } = await pool.query('SELECT id, user_id, status FROM papers WHERE id = $1', [req.body.paperId])
+    if (!canAccessPaperForChat({ paper: rows[0], userId: req.userId, userRole: req.userRole })) return res.status(404).json({ error: 'Paper not found' })
+    paperId = rows[0].id
+    indexPaper(pool, paperId).catch((err) => log('error', 'paper_index_failed', { paperId, message: err.message }))
+  }
+  const { rows } = await pool.query('INSERT INTO chat_sessions (user_id, paper_id) VALUES ($1, $2) RETURNING id', [req.userId, paperId])
+  res.status(201).json(await ownSession(rows[0].id, req.userId))
+})
+
+app.get('/api/chat/sessions/:id', auth, async (req, res) => {
+  const session = await ownSession(req.params.id, req.userId)
+  if (!session) return res.status(404).json({ error: 'Chat not found' })
+  const { rows } = await pool.query(
+    'SELECT id, role, content, sources, created_at FROM chat_messages WHERE session_id = $1 ORDER BY created_at, id LIMIT 500',
+    [session.id],
+  )
+  res.json({ ...session, messages: rows })
+})
+
+app.patch('/api/chat/sessions/:id', auth, writeLimiter, async (req, res) => {
+  if (!await ownSession(req.params.id, req.userId)) return res.status(404).json({ error: 'Chat not found' })
+  const title = normalizeChatTitle(req.body?.title, 'New chat')
+  await pool.query('UPDATE chat_sessions SET title = $2, updated_at = now() WHERE id = $1', [req.params.id, title])
+  res.json(await ownSession(req.params.id, req.userId))
+})
+
+app.delete('/api/chat/sessions/:id', auth, async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Chat not found' })
+  const { rowCount } = await pool.query('DELETE FROM chat_sessions WHERE id = $1 AND user_id = $2', [req.params.id, req.userId])
+  if (!rowCount) return res.status(404).json({ error: 'Chat not found' })
+  res.status(204).end()
+})
+
+app.post('/api/chat/sessions/:id/messages', auth, chatLimiter, async (req, res) => {
+  const session = await ownSession(req.params.id, req.userId)
+  if (!session) return res.status(404).json({ error: 'Chat not found' })
+  let question
+  try { question = parseChatQuestion(req.body?.question) } catch (err) { return res.status(err.status || 400).json({ error: err.message }) }
+
+  // Save the question first, so a failed answer can be retried without asking twice.
+  let userMessageId = isUuid(req.body?.retryMessageId) ? req.body.retryMessageId : null
+  if (userMessageId) {
+    const retry = await pool.query("SELECT id FROM chat_messages WHERE id = $1 AND session_id = $2 AND role = 'user'", [userMessageId, session.id])
+    if (!retry.rows[0]) userMessageId = null
+  }
+  if (!userMessageId) {
+    userMessageId = (await pool.query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1, 'user', $2) RETURNING id", [session.id, question])).rows[0].id
+  }
+  try {
+    const history = (await pool.query(
+      `SELECT role, content FROM (
+         SELECT role, content, created_at, id FROM chat_messages WHERE session_id = $1 AND id <> $2 ORDER BY created_at DESC, id DESC LIMIT 8
+       ) recent ORDER BY created_at, id`,
+      [session.id, userMessageId],
+    )).rows
+    await indexPendingPapers(pool, 5).catch(() => 0)
+    const searchText = history.length
+      ? await completeChat(buildStandaloneQueryMessages({ history, question, paperTitle: session.paper_title }), { maxTokens: 120 }).catch(() => question)
+      : question
+    const excerpts = await searchExcerpts(pool, { query: `${searchText} ${question}`, paperId: session.paper_id })
+    const answer = session.paper_id
+      ? await completeChat(buildPaperAnswerMessages({ question, paperTitle: session.paper_title, excerpts: excerpts.map((e) => e.content) }))
+      : await completeChat(buildSessionAnswerMessages({ history, question, excerpts: excerpts.map((e) => ({ title: e.title, paperId: e.paper_id, content: e.content })) }))
+    const sources = [...new Map(excerpts.map((e) => [String(e.paper_id), { paperId: Number(e.paper_id), title: e.title }])).values()]
+    const saved = (await pool.query(
+      "INSERT INTO chat_messages (session_id, role, content, sources) VALUES ($1, 'assistant', $2, $3::jsonb) RETURNING id, role, content, sources, created_at",
+      [session.id, answer || 'I could not find an answer in the available papers.', JSON.stringify(sources)],
+    )).rows[0]
+    const title = session.title === 'New chat' ? normalizeChatTitle(question, question) : session.title
+    await pool.query('UPDATE chat_sessions SET title = $2, updated_at = now() WHERE id = $1', [session.id, title])
+    res.status(201).json({ ...saved, userMessageId, session: await ownSession(session.id, req.userId) })
+  } catch (err) {
+    log('error', 'paper_chat_failed', { message: err.message })
+    res.status(err.status && err.status < 600 ? err.status : 502).json({ error: err.message || 'The AI could not answer right now.', userMessageId })
+  }
+})
+
+// Index newly published papers in the background (at start-up and hourly).
+setTimeout(() => indexPendingPapers(pool, 50).catch((err) => log('error', 'paper_index_failed', { message: err.message })), 5000).unref()
+setInterval(() => indexPendingPapers(pool, 50).catch(() => {}), 60 * 60 * 1000).unref()
 
 app.get('/api/users/suggestions', auth, async (req, res) => {
   const { rows } = await pool.query(

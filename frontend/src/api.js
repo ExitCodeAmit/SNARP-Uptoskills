@@ -39,6 +39,7 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
     err.field = data?.field
     err.code = data?.code
     err.data = data
+    err.userMessageId = data?.userMessageId
     if (isAdminArea() && (res.status === 401 || data?.code === 'account_blocked') && token) {
       window.dispatchEvent(new Event('snarp:desk-signed-out'))
     } else if (data?.code === 'account_blocked') {

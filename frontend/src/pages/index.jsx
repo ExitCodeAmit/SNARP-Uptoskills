@@ -14,6 +14,7 @@ import { apa, bibtex } from '../cite'
 import { FAQ } from '../content'
 import { api, apiBlob } from '../api'
 import { recordView } from '../views'
+import useChat from '../useChat'
 import PasswordMeter from '../components/PasswordMeter'
 import { Stars, StatusTag } from './review'
 import { passwordProblem } from '../password'
@@ -443,6 +444,27 @@ function PublishedPaperCard({ paper, onRemove }) {
   </article>
 }
 
+function AskAboutPaper({ paperId }) {
+  const navigate = useNavigate()
+  const { openPaperChat } = useChat()
+  const [state, setState] = useState({ busy: false, error: '' })
+  const ask = async () => {
+    setState({ busy: true, error: '' })
+    try {
+      await openPaperChat(paperId)
+      navigate('/chat')
+    } catch (error) {
+      setState({ busy: false, error: error.message })
+    }
+  }
+  return (
+    <>
+      <button type="button" className="btn btn-secondary btn-sm" onClick={ask} disabled={state.busy}>{state.busy ? 'Opening chat…' : 'Ask about this paper'}</button>
+      {state.error && <p className="field-error" role="alert">{state.error}</p>}
+    </>
+  )
+}
+
 export function PaperDetail({ user, onLogout }) {
   const { id } = useParams()
   const [result, setResult] = useState({ id: null, paper: null, error: '' })
@@ -475,7 +497,7 @@ export function PaperDetail({ user, onLogout }) {
       {paper.tags?.length > 0 && <><h2>Keywords</h2><div className="tag-row">{paper.tags.map((tag) => <span key={tag} className="tag">{tag}</span>)}</div></>}
       <h2>Full paper</h2>
       <PdfAttachment paperId={paper.id} filename={paper.pdf_filename} size={paper.pdf_size} title={paper.title} />
-      <div className="article-actions"><Link className="btn btn-ghost btn-sm" to="/articles">Back to papers</Link></div>
+      <div className="article-actions"><AskAboutPaper paperId={paper.id} /><Link className="btn btn-ghost btn-sm" to="/articles">Back to papers</Link></div>
     </article>
     <section className="panel paper-discussion" aria-label="Discussion">
       <h2>Discussion</h2>

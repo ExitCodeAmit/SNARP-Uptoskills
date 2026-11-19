@@ -21,6 +21,8 @@ import CitationNetwork from './CitationNetwork'
 import Leaderboard from './Leaderboard'
 import { Saved as Collections } from './Saved'
 import ResearcherMatching from './ResearcherMatching'
+import { ChatProvider } from './ChatContext'
+import ChatPage from './pages/ChatPage'
 
 import {
   Communities,
@@ -123,6 +125,7 @@ function SiteApp() {
   )
 
   return (
+    <ChatProvider user={user}>
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={guest('login')} />
@@ -165,6 +168,7 @@ function SiteApp() {
             <Route path="/leaderboard" element={<Leaderboard />} />
             <Route path="/collections" element={<Collections />} />
             <Route path="/researchers" element={<ResearcherMatching />} />
+            <Route path="/chat" element={<ChatPage />} />
             <Route path="/my-submissions" element={<MySubmissions />} />
             <Route path="/my-submissions/:id" element={<SubmissionFeedback user={user} />} />
             <Route path="/reviews" element={<ReviewQueue />} />
@@ -202,5 +206,6 @@ function SiteApp() {
         />
       </Routes>
     </BrowserRouter>
+    </ChatProvider>
   )
 }
