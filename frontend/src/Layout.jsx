@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  Rss, FilmReel, Books, FileText, ChatsCircle, Bell, GearSix, UsersThree,
+  Rss, FilmReel, Books, FileText, Graph, ChatsCircle, Bell, GearSix, UsersThree,
   SealCheck, ShieldCheck, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
+
 import { Avatar } from './components/ui'
 import { ROLE_LABEL } from './format'
 import { api } from './api'
@@ -12,11 +13,13 @@ import Assistant from './components/Assistant'
 import { useApplyTheme } from './theme'
 import logo from './assets/logo.png'
 
+// Main navigation
 const MAIN_NAV = [
   { to: '/', label: 'Feed', icon: Rss, end: true },
   { to: '/reels', label: 'Reels', icon: FilmReel },
   { to: '/articles', label: 'Papers', icon: Books, also: ['/saved', '/my-submissions'] },
   { to: '/docs', label: 'Docs', icon: FileText },
+  { to: '/citation-network', label: 'Citation network', icon: Graph },
   { to: '/messages', label: 'Messages', icon: ChatsCircle },
   { to: '/communities', label: 'Communities', icon: UsersThree, also: ['/events', '/tools'] },
 ]
@@ -166,11 +169,26 @@ export default function Layout({ user, onLogout }) {
 
   useEffect(() => {
     let active = true
-    const refresh = () => api('/notifications/unread-count').then((counts) => { if (active) setUnread(counts) }).catch(() => {})
+
+    const refresh = () => {
+      api('/notifications/unread-count')
+        .then((counts) => {
+          if (active) setUnread(counts)
+        })
+        .catch(() => {})
+    }
+
     refresh()
+
     const interval = setInterval(refresh, 30000)
+
     window.addEventListener('snarp:unread-changed', refresh)
-    return () => { active = false; clearInterval(interval); window.removeEventListener('snarp:unread-changed', refresh) }
+
+    return () => {
+      active = false
+      clearInterval(interval)
+      window.removeEventListener('snarp:unread-changed', refresh)
+    }
   }, [pathname])
 
   useEffect(() => {
@@ -192,12 +210,22 @@ export default function Layout({ user, onLogout }) {
 
   return (
     <div className="shell">
+      {/* Sidebar */}
       <aside className={`sidebar ${open ? 'open' : ''}`}>
         <div className="sidebar-top">
           <Link to="/" onClick={close}>
-            <img src={logo} alt="UptoSkills" className="sidebar-logo" />
+            <img
+              src={logo}
+              alt="UptoSkills"
+              className="sidebar-logo"
+            />
           </Link>
-          <button className="icon-btn sidebar-close" onClick={close} aria-label="Close menu">
+
+          <button
+            className="icon-btn sidebar-close"
+            onClick={close}
+            aria-label="Close menu"
+          >
             <X size={20} />
           </button>
         </div>
@@ -220,6 +248,7 @@ export default function Layout({ user, onLogout }) {
 
         </div>
 
+        {/* Logged-in user section */}
         <div className="sidebar-user">
           <button type="button" className="side-signout" onClick={onLogout}>
             <SignOut size={18} />
@@ -227,14 +256,24 @@ export default function Layout({ user, onLogout }) {
           </button>
         </div>
       </aside>
-      {open && <div className="scrim" onClick={close} />}
 
+      {open && (
+        <div className="scrim" onClick={close} />
+      )}
+
+      {/* Main content */}
       <div className="main">
         <header className="topbar">
           <button className={`icon-btn menu-btn ${unread.messages ? 'has-dot' : ''}`} onClick={() => setOpen(true)} aria-label={unread.messages ? 'Open menu, you have unread messages' : 'Open menu'}>
             <List size={22} />
           </button>
-          <form className="search" role="search" onSubmit={search}>
+
+          {/* Search bar */}
+          <form
+            className="search"
+            role="search"
+            onSubmit={search}
+          >
             <MagnifyingGlass size={18} />
             <SuggestBox
               value={query}
@@ -244,11 +283,13 @@ export default function Layout({ user, onLogout }) {
               inputProps={{ 'aria-label': 'Search papers, topics and people' }}
             />
           </form>
+
           <div className="topbar-actions">
             <NavLink to="/notifications" className="icon-btn icon-btn-lg topbar-bell" aria-label={unread.notifications ? `Notifications, ${unread.notifications} unread` : 'Notifications'} title="Notifications">
               <Bell size={21} weight={pathname === '/notifications' ? 'fill' : 'regular'} />
               {unread.notifications > 0 && <span className="nav-badge topbar-badge">{unread.notifications > 99 ? '99+' : unread.notifications}</span>}
             </NavLink>
+
             {pathname !== '/submit' && (
               <Link to="/submit" className="btn btn-primary" aria-label="Submit paper">
                 <Plus size={18} weight="bold" />
@@ -258,6 +299,7 @@ export default function Layout({ user, onLogout }) {
           </div>
         </header>
 
+        {/* Page content */}
         <div className="content">
           <Outlet />
         </div>

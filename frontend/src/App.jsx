@@ -17,6 +17,7 @@ import { safeNext } from './password'
 import Layout from './Layout'
 import Feed from './Feed'
 import Reels from './Reels'
+import CitationNetwork from './CitationNetwork'
 
 import {
   Communities,
@@ -98,6 +99,7 @@ function SiteApp() {
       await api('/auth/logout', { method: 'POST' })
     } catch {
     }
+
     clearToken()
     setUser(null)
   }
@@ -136,22 +138,37 @@ function SiteApp() {
             <Route path="/docs" element={<Suspense fallback={docsFallback}><DocsHome user={user} /></Suspense>} />
             <Route path="/docs/:documentId" element={<Suspense fallback={docsFallback}><DocsEditor user={user} /></Suspense>} />
             <Route path="/communities" element={<Communities />} />
-            <Route path="/communities/:id" element={<CommunityDetail user={user} />} />
+            <Route
+              path="/communities/:id"
+              element={<CommunityDetail user={user} />}
+            />
+
             <Route path="/articles" element={<Articles />} />
             <Route path="/articles/:id" element={<PaperDetail user={user} onLogout={logout} />} />
             <Route path="/saved" element={<SavedPapers />} />
             <Route path="/events" element={<Events user={user} />} />
-            <Route path="/events/:id" element={<EventDetail user={user} />} />
+            <Route
+              path="/events/:id"
+              element={<EventDetail user={user} />}
+            />
+
             <Route path="/messages" element={<Messages user={user} />} />
             <Route path="/notifications" element={<Notifications user={user} />} />
             <Route path="/tools" element={<Tools />} />
             <Route path="/submit" element={<Submit user={user} onUserUpdate={setUser} />} />
             <Route path="/moderation" element={<Navigate to="/moderator" replace />} />
             <Route path="/moderator" element={['admin', 'moderator'].includes(user.role) ? <ModeratorDashboard /> : <AccessDenied title="Moderator dashboard" text="This area is only for moderators and the Super Admin." />} />
+            <Route path="/citation-network" element={<CitationNetwork />} />
             <Route path="/my-submissions" element={<MySubmissions />} />
             <Route path="/my-submissions/:id" element={<SubmissionFeedback user={user} />} />
             <Route path="/reviews" element={<ReviewQueue />} />
             <Route path="/reviews/:id" element={<ReviewWorkspace user={user} />} />
+
+            {/* Citation Network */}
+            <Route
+              path="/citation-network"
+              element={<CitationNetwork />}
+            />
 
             <Route
               path="/settings"
