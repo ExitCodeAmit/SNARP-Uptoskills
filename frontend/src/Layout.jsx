@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Link, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  Rss, FilmReel, Books, FileText, Graph, Trophy, ChatsCircle, Bell, GearSix, UsersThree,
+  Rss, FilmReel, Books, FileText, Graph, Trophy, FolderOpen, ChatsCircle, Bell, GearSix, UsersThree,
   SealCheck, ShieldCheck, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
 
@@ -21,6 +21,7 @@ const MAIN_NAV = [
   { to: '/docs', label: 'Docs', icon: FileText },
   { to: '/citation-network', label: 'Citation network', icon: Graph },
   { to: '/leaderboard', label: 'Leaderboard', icon: Trophy },
+  { to: '/collections', label: 'Collections', icon: FolderOpen },
   { to: '/messages', label: 'Messages', icon: ChatsCircle },
   { to: '/communities', label: 'Communities', icon: UsersThree, also: ['/events', '/tools'] },
 ]

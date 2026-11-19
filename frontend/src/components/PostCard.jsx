@@ -6,6 +6,7 @@ import { Avatar } from './ui'
 import { Overlay } from './Overlay'
 import { ROLE_LABEL, timeAgo } from '../format'
 import { ExpandableText, Linkify } from './RichText'
+import { SaveButton } from '../Saved'
 
 const MAX = 5000
 const compactViews = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 })
@@ -291,7 +292,9 @@ export default function PostCard({ post, viewerId, viewerRole, onUpdate, onRemov
             loading="lazy"
           />
         )}
-        <PostActions post={post} viewerId={viewerId} canModerate={canModerate} onUpdate={onUpdate} onLogout={onLogout} />
+        <PostActions post={post} viewerId={viewerId} canModerate={canModerate} onUpdate={onUpdate} onLogout={onLogout}>
+          <SaveButton itemType="post" itemId={post.id} isSaved={!!post.saved_item_id} savedFolderId={post.saved_folder_id} savedItemId={post.saved_item_id} />
+        </PostActions>
       </div>
     </Tag>
   )
