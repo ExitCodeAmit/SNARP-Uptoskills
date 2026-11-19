@@ -2,9 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildPaperDiscovery } from './paper-search.js'
 
-test('builds approved-only paper discovery filters with bound values', () => {
+test('builds published-only paper discovery filters with bound values', () => {
   const query = buildPaperDiscovery({ q: 'AI_%', author: 'Asha', domain: 'Education', tag: 'NLP' })
-  assert.match(query.searchSql, /p\.status = 'approved'/)
+  assert.match(query.searchSql, /p\.status = 'published'/)
   assert.match(query.searchSql, /p\.authors::text ILIKE \$2/)
   assert.match(query.searchSql, /lower\(p\.domain\) = lower\(\$3\)/)
   assert.match(query.searchSql, /unnest\(p\.tags\)/)
@@ -21,7 +21,7 @@ test('bounds pagination and ignores unrecognized sort expressions', () => {
   assert.equal(query.limit, 50)
   assert.equal(query.values[0], 50)
   assert.equal(query.values[1], 4_999_950)
-  assert.match(query.searchSql, /ORDER BY COALESCE\(p\.reviewed_at, p\.created_at\) DESC, p\.id DESC/)
+  assert.match(query.searchSql, /ORDER BY COALESCE\(p\.published_at, p\.created_at\) DESC, p\.id DESC/)
   assert.doesNotMatch(query.searchSql, /DROP TABLE/)
 })
 

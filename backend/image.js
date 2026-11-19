@@ -1,4 +1,3 @@
-// Detects the real image type from file bytes; never trust the filename or client MIME type
 export function sniffImage(buf) {
   const ascii = (a, b) => buf.subarray(a, b).toString('latin1')
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'

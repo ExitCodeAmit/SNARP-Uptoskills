@@ -1,4 +1,4 @@
-# 🗄️ SNARP — Database Setup Guide
+# 🗄️ SNARP Database Setup Guide
 
 Complete step-by-step guide to install **PostgreSQL**, set up **pgAdmin 4**, create the project database, and connect everything to the SNARP backend.
 
@@ -11,7 +11,7 @@ Complete step-by-step guide to install **PostgreSQL**, set up **pgAdmin 4**, cre
 3. [Install pgAdmin 4](#3-install-pgadmin-4)
 4. [Verify PostgreSQL Installation](#4-verify-postgresql-installation)
 5. [Connect to PostgreSQL via pgAdmin 4](#5-connect-to-postgresql-via-pgadmin-4)
-6. [Create the SNARP Database (Manual — Optional)](#6-create-the-snarp-database-manual--optional)
+6. [Create the SNARP Database (Manual, Optional)](#6-create-the-snarp-database-manual-optional)
 7. [Configure the Backend `.env` File](#7-configure-the-backend-env-file)
 8. [Run the Backend (Auto-Creates DB & Tables)](#8-run-the-backend-auto-creates-db--tables)
 9. [Verify Tables in pgAdmin](#9-verify-tables-in-pgadmin)
@@ -33,7 +33,7 @@ Complete step-by-step guide to install **PostgreSQL**, set up **pgAdmin 4**, cre
 
 ## 2. Install PostgreSQL
 
-### Step 1 — Download the Installer
+### Step 1: Download the Installer
 
 1. Go to the official download page:  
    👉 **<https://www.postgresql.org/download/windows/>**
@@ -41,17 +41,17 @@ Complete step-by-step guide to install **PostgreSQL**, set up **pgAdmin 4**, cre
 3. Select the **latest stable version** (e.g. PostgreSQL 16.x) for **Windows x86-64**.
 4. Click **Download** and save the `.exe` file.
 
-### Step 2 — Run the Installer
+### Step 2: Run the Installer
 
 1. Double-click the downloaded `.exe` file to launch the installer.
 2. Click **Next** on the welcome screen.
 
-### Step 3 — Choose Installation Directory
+### Step 3: Choose Installation Directory
 
 - Keep the default path (e.g. `C:\Program Files\PostgreSQL\16`) or change it.
 - Click **Next**.
 
-### Step 4 — Select Components
+### Step 4: Select Components
 
 Make sure **all** of these are checked:
 
@@ -65,28 +65,28 @@ Make sure **all** of these are checked:
 
 Click **Next**.
 
-### Step 5 — Set Data Directory
+### Step 5: Set Data Directory
 
 - Keep the default (e.g. `C:\Program Files\PostgreSQL\16\data`).
 - Click **Next**.
 
-### Step 6 — Set Superuser Password 🔑
+### Step 6: Set Superuser Password 🔑
 
 - Enter a **password** for the default `postgres` superuser.
 - ⚠️ **Remember this password!** You will need it for the `.env` file later.
 - Click **Next**.
 
-### Step 7 — Set Port
+### Step 7: Set Port
 
-- Default port: **`5432`** — keep this unless you have a conflict.
+- Default port: **`5432`**. Keep this unless you have a conflict.
 - Click **Next**.
 
-### Step 8 — Select Locale
+### Step 8: Select Locale
 
 - Keep the default locale.
 - Click **Next**.
 
-### Step 9 — Install
+### Step 9: Install
 
 - Review the summary and click **Next** to begin installation.
 - Wait for the installation to complete (~2-5 minutes).
@@ -149,11 +149,11 @@ psql -U postgres -h localhost -p 5432
 
 ## 5. Connect to PostgreSQL via pgAdmin 4
 
-### Step 1 — Open pgAdmin 4
+### Step 1: Open pgAdmin 4
 
 Launch **pgAdmin 4** from the Start Menu. It opens in your browser.
 
-### Step 2 — Register a New Server
+### Step 2: Register a New Server
 
 1. In the left sidebar, right-click **Servers** → **Register** → **Server…**
 2. Fill in the **General** tab:
@@ -175,7 +175,7 @@ Launch **pgAdmin 4** from the Start Menu. It opens in your browser.
 
 4. Click **Save**.
 
-### Step 3 — Confirm Connection
+### Step 3: Confirm Connection
 
 - In the left sidebar, expand **Servers → SNARP Local → Databases**.
 - You should see the default `postgres` database listed.
@@ -183,12 +183,12 @@ Launch **pgAdmin 4** from the Start Menu. It opens in your browser.
 
 ---
 
-## 6. Create the SNARP Database (Manual — Optional)
+## 6. Create the SNARP Database (Manual, Optional)
 
 > [!IMPORTANT]
 > The backend server **auto-creates** the `snarp` database and all tables on first run (see [Section 8](#8-run-the-backend-auto-creates-db--tables)). This manual step is **only** if you want to create it ahead of time or need to troubleshoot.
 
-### Option A — Via pgAdmin 4
+### Option A: Via pgAdmin 4
 
 1. In the left sidebar, right-click **Databases** → **Create** → **Database…**
 2. Set:
@@ -200,7 +200,7 @@ Launch **pgAdmin 4** from the Start Menu. It opens in your browser.
 
 3. Click **Save**.
 
-### Option B — Via Command Line
+### Option B: Via Command Line
 
 ```powershell
 psql -U postgres -h localhost -p 5432 -c "CREATE DATABASE snarp;"
@@ -219,7 +219,6 @@ backend/.env
 Set the following values:
 
 ```env
-# PostgreSQL Connection
 PGHOST=localhost
 PGPORT=5432
 PGUSER=postgres
@@ -227,21 +226,13 @@ PGPASSWORD=your_actual_password_here
 PGDATABASE=snarp
 PGPOOL_MAX=10
 
-# Server Port
 PORT=5000
 
-# Max PDF upload size in bytes (default 10 MB)
 PAPER_MAX_PDF_BYTES=10485760
-
-# Local development may leave JWT_SECRET unset; production must provide a unique secret of at least 32 bytes.
-# JWT_SECRET=
-
-# Only configure behind a trusted reverse proxy: hop count or trusted proxy IP/CIDRs.
-# TRUST_PROXY=
 ```
 
 > [!CAUTION]
-> Replace `your_actual_password_here` with the real PostgreSQL superuser password you set during installation. **Never commit the `.env` file to Git** — it is already in `.gitignore`.
+> Replace `your_actual_password_here` with the real PostgreSQL superuser password you set during installation. **Never commit the `.env` file to Git**. It is already in `.gitignore`.
 
 ### Environment Variables Explained
 
@@ -262,14 +253,14 @@ PAPER_MAX_PDF_BYTES=10485760
 
 ## 8. Run the Backend (Auto-Creates DB & Tables)
 
-### Step 1 — Install Dependencies
+### Step 1: Install Dependencies
 
 ```powershell
 cd backend
 npm install
 ```
 
-### Step 2 — Start the Server
+### Step 2: Start the Server
 
 ```powershell
 npm run dev
@@ -283,11 +274,11 @@ The server's `setupDb()` function automatically:
 2. **Checks** if a database named `snarp` exists.
 3. **Creates** the `snarp` database if it doesn't exist.
 4. **Applies** ordered migrations `001` through `007`, creating and upgrading all feature tables and indexes. Applied versions are recorded in `schema_migrations`.
-   - `users` — User accounts with roles (admin, moderator, author, user)
-   - `auth_sessions` — Active and revoked login sessions
-   - `images` — Post images stored as BYTEA
-   - `posts` — Social-style posts with optional images
-   - `papers` — Research paper submissions with PDF storage
+   - `users`: User accounts with roles (admin, moderator, author, user)
+   - `auth_sessions`: Active and revoked login sessions
+   - `images`: Post images stored as BYTEA
+   - `posts`: Social-style posts with optional images
+   - `papers`: Research paper submissions with PDF storage
 5. **In local development only**, generates a `JWT_SECRET` and appends it to `.env` if not already set. Production must provide its secret through environment configuration or a secret manager.
 
 Expected console output:
@@ -389,8 +380,6 @@ CREATE TABLE posts (
   image_id   UUID REFERENCES images(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Constraint: body ≤ 5000 chars, and at least body or image must be present
--- Index on created_at DESC for feed ordering
 ```
 
 ### `papers`
@@ -419,7 +408,6 @@ CREATE TABLE papers (
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (user_id, idempotency_key)
 );
--- Index on (status, created_at DESC) for moderation queue
 ```
 
 ---
@@ -485,7 +473,7 @@ Then kill the conflicting process or change `PGPORT` in `.env` to another port (
 
 **Cause:** You manually created the database before running the server.
 
-**Fix:** This is harmless — the server's `setupDb()` skips creation if the DB already exists.
+**Fix:** This is harmless. The server's `setupDb()` skips creation if the DB already exists.
 
 ---
 

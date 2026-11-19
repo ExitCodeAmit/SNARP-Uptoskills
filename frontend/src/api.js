@@ -1,5 +1,14 @@
-// "Remember me" keeps the token in localStorage; otherwise it lives for the browser session only
-export const getToken = () => localStorage.getItem('token') || sessionStorage.getItem('token')
+const ADMIN_KEY = 'snarp-desk-token'
+
+export const isAdminArea = () => window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/')
+
+export const getAdminToken = () => sessionStorage.getItem(ADMIN_KEY)
+export const saveAdminToken = (token) => sessionStorage.setItem(ADMIN_KEY, token)
+export const clearAdminToken = () => sessionStorage.removeItem(ADMIN_KEY)
+
+export const getToken = () => (isAdminArea()
+  ? getAdminToken()
+  : localStorage.getItem('token') || sessionStorage.getItem('token'))
 
 export function saveToken(token, remember) {
   ;(remember ? localStorage : sessionStorage).setItem('token', token)
@@ -28,6 +37,13 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
     const err = new Error(data?.error || 'Could not reach the server. Is the backend running?')
     err.status = res.status
     err.field = data?.field
+    err.code = data?.code
+    err.data = data
+    if (isAdminArea() && (res.status === 401 || data?.code === 'account_blocked') && token) {
+      window.dispatchEvent(new Event('snarp:desk-signed-out'))
+    } else if (data?.code === 'account_blocked') {
+      window.dispatchEvent(new Event('snarp:account-blocked'))
+    }
     throw err
   }
   return data

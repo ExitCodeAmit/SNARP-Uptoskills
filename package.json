@@ -1,0 +1,14 @@
+{
+  "name": "snarp",
+  "private": true,
+  "description": "SNARP: Social Networking & Academic Research Platform (UptoSkills)",
+  "scripts": {
+    "build": "npm ci --prefix backend --omit=dev && npm ci --prefix frontend && npm run build --prefix frontend",
+    "start": "npm start --prefix backend",
+    "test": "npm test --prefix backend && npm test --prefix frontend && npm run lint --prefix frontend",
+    "smoke": "npm run smoke --prefix backend"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

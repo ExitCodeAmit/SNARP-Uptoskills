@@ -1,4 +1,3 @@
--- Durable paper decision history and a minimal administrative audit trail.
 CREATE TABLE paper_reviews (
   id          BIGSERIAL PRIMARY KEY,
   paper_id    BIGINT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,

@@ -1,4 +1,3 @@
-/* Landing page. Reuses colour tokens and .btn from index.css. Solid colours only. */
 .landing,
 .smooth-content {
   background: var(--surface);
@@ -23,7 +22,6 @@
   font-size: 1.02rem;
 }
 
-/* ---------- Floating nav ---------- */
 .l-nav {
   position: fixed;
   top: 14px;
@@ -94,7 +92,6 @@
   border-radius: 999px;
 }
 
-/* ---------- Hero ---------- */
 .hero {
   --h1: clamp(2.7rem, 6vw, 5.6rem);
   padding: 150px 0 80px;
@@ -121,7 +118,6 @@
   margin-top: 0.06em;
 }
 
-/* Rotating word: a solid block that changes colour and width per word */
 .rotator {
   position: relative;
   display: inline-grid;
@@ -243,7 +239,6 @@
   fill: var(--teal-ink);
 }
 
-/* ---------- Marquee ---------- */
 .mq {
   overflow: hidden;
   padding: 44px 0;
@@ -284,7 +279,6 @@
 .star-blue { background: var(--blue); }
 .star-yellow { background: var(--yellow); }
 
-/* ---------- Section type ---------- */
 .l-h2 {
   font-size: clamp(2.3rem, 5vw, 4.5rem);
   font-weight: 800;
@@ -300,7 +294,6 @@
   color: var(--text-2);
 }
 
-/* ---------- Feature stack ---------- */
 .features {
   padding: 140px 0 80px;
 }
@@ -335,7 +328,6 @@
   transform-origin: 50% 0%;
 }
 
-/* Darkens a card as the next one slides over it */
 .stack-inner::after {
   content: '';
   position: absolute;
@@ -394,7 +386,6 @@
   min-height: 380px;
 }
 
-/* Photos */
 .v-photos {
   position: relative;
   width: 100%;
@@ -456,7 +447,6 @@
   color: var(--teal);
 }
 
-/* Paper */
 .v-paper {
   display: grid;
   place-items: center;
@@ -548,7 +538,6 @@
   box-shadow: 0 14px 30px rgba(23, 33, 47, 0.25);
 }
 
-/* Communities */
 .v-chips {
   display: flex;
   flex-wrap: wrap;
@@ -591,7 +580,6 @@
 .ini-blue { background: var(--blue-soft); color: var(--blue); }
 .ini-yellow { background: var(--yellow-soft); color: var(--yellow-ink); }
 
-/* Citation */
 .v-cite {
   width: min(500px, 100%);
   padding: 24px;
@@ -657,7 +645,6 @@
   50% { opacity: 0; }
 }
 
-/* Notifications */
 .v-notifs {
   display: flex;
   flex-direction: column;
@@ -714,7 +701,6 @@
   font-size: 0.78rem;
 }
 
-/* ---------- How it works ---------- */
 .journey {
   overflow: hidden;
   background: var(--bg);
@@ -754,7 +740,7 @@
   padding-bottom: 0.06em;
   font-size: clamp(3.2rem, 7vw, 7.5rem);
   font-weight: 800;
-  line-height: 1.16; /* tall enough that the char masks keep g, p and y descenders */
+  line-height: 1.16;
   letter-spacing: -0.055em;
   white-space: nowrap;
 }
@@ -772,7 +758,6 @@
   color: var(--text-2);
 }
 
-/* Horizontal pan layout, switched on by JS on desktop */
 .journey.is-pan {
   height: 100dvh;
 }
@@ -798,7 +783,6 @@
   width: 42vw;
 }
 
-/* ---------- Statement ---------- */
 .statement {
   padding: 170px 0 150px;
 }
@@ -815,7 +799,6 @@
 .key-t { color: var(--teal-ink); }
 .key-b { color: var(--blue); }
 
-/* ---------- CTA ---------- */
 .cta {
   padding-bottom: 140px;
 }
@@ -855,7 +838,6 @@
   margin-top: 24px;
 }
 
-/* ---------- Footer ---------- */
 .l-footer {
   overflow: hidden;
   background: var(--bg);
@@ -930,7 +912,6 @@
   user-select: none;
 }
 
-/* ---------- Responsive ---------- */
 @media (max-width: 1200px) {
   .v-photos,
   .v-paper {
