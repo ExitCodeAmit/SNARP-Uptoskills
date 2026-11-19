@@ -10,7 +10,8 @@
     "reset-password": "node --env-file-if-exists=.env scripts/reset-password.mjs",
     "mail:test": "node --env-file-if-exists=.env scripts/check-mail.mjs",
     "make-super-admin": "node --env-file-if-exists=.env scripts/make-super-admin.mjs",
-    "migrate": "node --env-file-if-exists=.env migrate.js"
+    "migrate": "node --env-file-if-exists=.env migrate.js",
+    "seed:demo": "node --env-file-if-exists=.env seed-demo-papers.js"
   },
   "dependencies": {
     "@hocuspocus/extension-database": "^4.8.0",

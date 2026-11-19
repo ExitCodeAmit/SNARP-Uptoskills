@@ -218,6 +218,19 @@ Open **http://localhost:5173**, create an account, and post.
 | backend | `npm run reset-password -- <email>` | Set a new password for an account from the server (hidden input) and sign it out everywhere; audited |
 | backend | `npm run mail:test [-- you@example.com]` | Checks the SMTP login from `.env` and optionally sends a test email; explains common problems such as a Gmail password instead of an App Password |
 | backend | `npm run smoke [url]` | End-to-end API check against a running server and database; its temporary account deletes itself at the end. The server must run with `REQUIRE_EMAIL_VERIFICATION=false` |
+| backend | `npm run seed:demo` | Seed synthetic recommendation examples through local submission and moderation APIs (development only) |
+
+### Seed recommendation demo data
+
+Start PostgreSQL and the backend first. In a separate PowerShell terminal in `backend`, explicitly enable the local-only seed and run it:
+
+```powershell
+$env:NODE_ENV = 'development'
+$env:ALLOW_DEMO_SEED = 'true'
+npm run seed:demo
+```
+
+The repeatable seed submits ten synthetic papers, with valid demonstration PDFs, under clearly marked demo accounts and approves them through the existing moderation API. Their tags and notes identify them as `DEMO DATA`; their dates are illustrative only, and they have no DOI or real-person authors. The seed refuses production mode, production-named databases, and non-local PostgreSQL hosts. It does not update or remove existing records. After seeding, save interests from **Settings** using the existing profile form, then open `/search`.
 
 ### Resetting the postgres password
 
@@ -344,6 +357,7 @@ erDiagram
         VARCHAR(255) email "NOT NULL, UNIQUE"
         TEXT password_hash "bcrypt hash"
         VARCHAR(20) role "admin | moderator | author | user"
+        TEXT[] research_interests "NOT NULL, default empty list"
         TIMESTAMPTZ created_at "DEFAULT now()"
         TIMESTAMPTZ last_login_at "nullable"
         TIMESTAMPTZ email_verified_at "null until confirmed"
@@ -514,6 +528,7 @@ erDiagram
         TEXT abstract "NOT NULL"
         VARCHAR(255) doi "nullable"
         VARCHAR(120) domain "NOT NULL"
+        DATE publication_date "nullable"
         TEXT[] tags
         JSONB authors
         BYTEA pdf_data "PDF, maximum 10 MB"
@@ -539,6 +554,7 @@ erDiagram
 | `email` | `VARCHAR(255)` | Not null, unique, stored lowercase |
 | `password_hash` | `TEXT` | bcrypt hash (cost 10), never returned by the API |
 | `role` | `VARCHAR(20)` | `admin`, `moderator`, `author` or `user`, default `user` |
+| `research_interests` | `TEXT[]` | Saved recommendation topics; defaults to an empty list |
 | `created_at` | `TIMESTAMPTZ` | Default `now()` |
 | `last_login_at` | `TIMESTAMPTZ` | Set on every successful sign-up or login (migration 009) |
 | `email_verified_at` | `TIMESTAMPTZ` | Null until the emailed link is opened; login is refused while null (migration 010) |
@@ -616,6 +632,7 @@ Migration `001_initial_schema.sql` creates this table if it does not exist. It s
 | `user_id` | `INTEGER` | References `users(id)`, cascade delete |
 | `title`, `abstract`, `domain` | `VARCHAR` / `TEXT` | Required paper metadata |
 | `doi` | `VARCHAR(255)` | Optional validated DOI |
+| `publication_date` | `DATE` | Optional date supplied with the submission |
 | `tags` | `TEXT[]` | Research keywords |
 | `authors` | `JSONB` | Author names and optional affiliations |
 | `pdf_data` | `BYTEA` | Validated PDF content, up to 10 MB |
@@ -661,6 +678,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `DELETE` | `/auth/sessions` | Yes | | `{ revoked }`; signs out every other device |
 | `DELETE` | `/auth/sessions/:id` | Yes | | `204`; signs out one of your own sessions, `404` otherwise |
 | `PUT` | `/auth/me/photo` | Yes | `multipart/form-data`: `photo` (JPEG, PNG, GIF or WebP, max 5 MB) | `200 { avatar_url }` |
+| `PATCH` | `/auth/profile` | Yes | JSON `{ research_interests: string[] }` (up to 20 interests, 100 characters each) | `200 { research_interests }` |
 | `GET` | `/users/search?q=...` | Yes | | Up to 20 matching public researcher profiles |
 | `GET` | `/users/friends` | Yes | Optional `q` name filter | Friends (people you follow who follow you back): `{ id, name, role, avatar_url, institution }[]`, up to 200 |
 | `GET` | `/users/suggestions` | Yes | | Up to 5 researchers the viewer does not follow, ranked by shared research interests then followers |
@@ -702,7 +720,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `DELETE` | `/communities/:communityId/posts/:postId` | Author/Community owner/Moderator | | `204` |
 | `GET` | `/images/:uuid` | No | | Image bytes with the correct `Content-Type` |
 | `POST` | `/papers/analyze` | Author | `multipart/form-data`: `pdf` | Suggestions read from the first 5 pages, nothing stored: `{ title, abstract, authors: [{ name, affiliation }], tags, doi, domain, notes, pages, text_found, looks_like_paper, sources }`. `422` for unreadable or slow PDFs, `503` when busy; 10 per minute per author |
-| `POST` | `/papers/submit` | Author | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, JSON `tags`, JSON `authors` (first entry `{ user_id: <you> }`, each co-author `{ user_id, affiliation }` of a friend; names come from the accounts), optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
+| `POST` | `/papers/submit` | Author | `multipart/form-data`: `title`, `abstract`, optional `doi`, `domain`, optional `publicationDate` (`YYYY-MM-DD`), JSON `tags`, JSON `authors` (first entry `{ user_id: <you> }`, each co-author `{ user_id, affiliation }` of a friend; names come from the accounts), optional `additionalNotes`, `pdf` file; optional `Idempotency-Key` header | `201 { id, title, status, submittedAt }` (repeat key returns `200`) |
 | `GET` | `/papers/my-submissions` | Yes | | Own submissions with status, round, revision note, rejection reason and review count |
 | `POST` | `/papers/:id/coauthor-update` | Submitter, status `coauthor_check` | `multipart/form-data`: `pdf`, `note` | `{ round, draft }`; replaces the PDF with a new draft (old one archived), co-authors asked to check again |
 | `PUT` | `/papers/:id/coauthor-check` | Co-author | JSON `{ decision: "approve" | "changes", comment }` (comment required for changes) | Saves the verdict on the current PDF (round and draft), notifies the submitter; when every co-author approves, the paper moves to peer review. `409` outside the co-author check |
@@ -719,6 +737,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `GET` | `/papers/categories` | Yes | | Distinct categories used by approved papers |
 | `GET` | `/papers/trending-tags` | Yes | | Up to 8 most used keywords on papers approved in the last 180 days, with paper counts |
 | `GET` | `/papers/recommendations?limit=6` | Yes | `limit` 1 to 12 | `{ personalised, hasInterests, basedOn, items, topics }`; each item has `reasons`; papers you wrote, saved or liked are left out |
+| `GET` | `/papers/interest-matches` | Yes | | Published papers matching the viewer's saved research interests, each with a `score` and `matched_interests` signals (shown on Search) |
 | `GET` | `/papers/:id/related` | Yes | | Up to 4 approved papers that share keywords, authors, category or wording, each with a `reason` |
 | `GET` | `/search/suggest?q=...` | Yes | `q` needs at least 2 characters | `{ topics, papers, people }` for the search dropdowns |
 | `GET` | `/papers/saved` | Yes | | The viewer's saved approved papers, newest save first |
@@ -738,7 +757,7 @@ Profile photos are stored in the `images` table. Their UUID image URLs are ungue
 | `PATCH` | `/moderation/papers/:id/reject` | Moderator/Admin | JSON `{ "reason": "..." }` | Atomic pending → rejected decision with reviewer, history and audit record |
 | `GET` | `/admin/audit-logs?page=1&limit=50` | Admin | Optional page/limit | Paginated moderation audit records |
 
-Paper discovery supports title/abstract/DOI/author/domain/tag matching, exact category filtering, four sort orders and bounded page-based pagination. The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; discovery and detail queries filter to `approved` in SQL.
+Paper discovery supports title/abstract/DOI/author/domain/tag matching, exact category filtering, four sort orders and bounded page-based pagination. Recommendations award +3 for an exact tag match, +4 for a domain match, +2 for a title match, and +1 for an abstract match per distinct saved interest. The authenticated endpoint excludes the requesting user's papers and all non-approved papers, removes duplicates, returns at most ten results, and uses publication date (or submission date if unavailable) to break score ties. Each result includes `score` and `matched_interests` with matching fields and point values. The PDF endpoint never returns pending or rejected papers to other users, and paper bytes are not included in metadata responses. PDF uploads are checked by their `%PDF-` signature, not their filename or client-provided MIME type. Only Admin/Moderator users can access moderation endpoints; discovery and detail queries filter to `approved` in SQL.
 
 **Example: submit a paper with curl**
 
@@ -846,6 +865,9 @@ SNARP-Uptoskills/
 │   ├── image.js              Detects real image type from file bytes
 │   ├── image.test.js         Tests for image.js
 │   ├── scripts/smoke.mjs     End-to-end API smoke test (npm run smoke)
+│   ├── recommendations.js    Paper recommendation scoring and ranking
+│   ├── recommendations.test.js Tests for recommendation scoring and ranking
+│   ├── seed-demo-papers.js   Development-only demo data via submission and moderation APIs
 │   ├── .env.example          Template for backend/.env (copy and fill in)
 │   ├── package.json
 │   └── package-lock.json

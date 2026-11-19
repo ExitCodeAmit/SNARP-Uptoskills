@@ -13,6 +13,7 @@ import {
 } from './story.js'
 import { DEFAULT_MAX_PDF_BYTES, isPdf, validatePaperSubmission } from './paper.js'
 import { analysePdf } from './pdf-analysis.js'
+import { rankRecommendations } from './recommendations.js'
 import { createSessionToken, REMEMBERED_SESSION_SECONDS, TEMPORARY_SESSION_SECONDS, verifySessionToken } from './session.js'
 import { runMigrations } from './migrate.js'
 import { validateProfileUpdate } from './profile.js'
@@ -1354,7 +1355,7 @@ app.get('/api/posts', auth, async (req, res) => {
         (SELECT count(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
         false AS saved_by_me,
         NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
-        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi,
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi, NULL::text AS publication_date,
         NULL::text AS pdf_filename, NULL::int AS pdf_size
       FROM posts p JOIN users u ON u.id = p.user_id
       WHERE NOT $4::boolean OR p.user_id IN (SELECT user_id FROM visible)
@@ -1366,7 +1367,7 @@ app.get('/api/posts', auth, async (req, res) => {
         EXISTS (SELECT 1 FROM paper_likes pl WHERE pl.paper_id = rp.id AND pl.user_id = $3) AS liked_by_me,
         (SELECT count(*)::int FROM paper_comments pc WHERE pc.paper_id = rp.id) AS comment_count,
         EXISTS (SELECT 1 FROM paper_saves ps WHERE ps.paper_id = rp.id AND ps.user_id = $3) AS saved_by_me,
-        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi,
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi, rp.publication_date::text AS publication_date,
         rp.pdf_filename, rp.pdf_size
       FROM papers rp JOIN users u ON u.id = rp.user_id
       WHERE rp.status = 'published' AND (NOT $4::boolean OR rp.user_id IN (SELECT user_id FROM visible))
@@ -1538,11 +1539,44 @@ app.get('/api/papers/my-submissions', auth, async (req, res) => {
   res.json(rows)
 })
 
+// Papers matching the viewer's saved research interests, with a score and the matching signals.
+app.get('/api/papers/interest-matches', auth, async (req, res) => {
+  const profile = await pool.query('SELECT research_interests FROM user_profiles WHERE user_id = $1', [req.userId])
+  const interests = profile.rows[0]?.research_interests ?? []
+  if (!interests.length) return res.json([])
+
+  const { rows } = await pool.query(`
+    SELECT p.id, p.user_id, p.status, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi,
+      p.publication_date::text AS publication_date,
+      p.reviewed_at, p.published_at, p.created_at
+    FROM papers p
+    WHERE p.status = 'published'
+      AND p.user_id <> $1
+      AND EXISTS (
+        SELECT 1
+        FROM unnest($2::text[]) AS user_interest(interest)
+        WHERE trim(user_interest.interest) <> ''
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(p.tags, '{}'::text[])) AS paper_tag(tag)
+              WHERE lower(trim(paper_tag.tag)) = lower(trim(user_interest.interest))
+            )
+            OR position(lower(trim(user_interest.interest)) IN lower(p.domain)) > 0
+            OR position(lower(trim(user_interest.interest)) IN lower(p.title)) > 0
+            OR position(lower(trim(user_interest.interest)) IN lower(p.abstract)) > 0
+          )
+      )
+    ORDER BY COALESCE(p.publication_date, p.published_at::date, p.created_at::date) DESC, p.id DESC
+    LIMIT 200`, [req.userId, interests])
+  res.json(rankRecommendations(rows, interests, req.userId))
+})
+
 app.get('/api/papers/:id', auth, async (req, res) => {
   if (!isSafeId(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
   const { rows } = await pool.query(
     `SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors,
-      p.reviewed_at, p.published_at, p.created_at, p.user_id, u.name AS submitter_name, p.round, p.pdf_filename, p.pdf_size,
+      p.publication_date::text AS publication_date, p.reviewed_at, p.published_at, p.created_at, p.user_id, u.name AS submitter_name, p.round, p.pdf_filename, p.pdf_size,
       (SELECT count(DISTINCT r.reviewer_id)::int FROM peer_reviews r WHERE r.paper_id = p.id) AS reviewer_count,
       (SELECT round(avg(r.overall_rating), 1)::float FROM peer_reviews r WHERE r.paper_id = p.id AND r.round = p.round) AS avg_rating,
       (SELECT count(*)::int FROM paper_likes pl WHERE pl.paper_id = p.id) AS like_count, (SELECT count(*)::int FROM paper_views pw WHERE pw.paper_id = p.id) AS view_count,
@@ -2480,8 +2514,8 @@ app.post('/api/papers/submit', auth, requireAuthor, writeLimiter, paperUpload.si
     inserted = await pool.query(
       `INSERT INTO papers
          (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
-          pdf_content_type, pdf_size, additional_notes, idempotency_key, status, file_hash, content_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13, $14, $15)
+          pdf_content_type, pdf_size, additional_notes, idempotency_key, status, file_hash, content_hash, publication_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (user_id, idempotency_key) DO NOTHING
        RETURNING id, title, status, created_at`,
       [
@@ -2500,6 +2534,7 @@ app.post('/api/papers/submit', auth, requireAuthor, writeLimiter, paperUpload.si
         paper.authors.length > 1 ? 'coauthor_check' : 'pending',
         fHash,
         cHash,
+        paper.publicationDate,
       ]
     )
   } catch (err) {

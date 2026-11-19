@@ -21,6 +21,19 @@ import PdfAttachment from '../components/PdfAttachment'
 import { PdfReader } from '../components/Overlay'
 import { QueryTopics, Recommendations, RelatedPapers, SuggestBox } from '../components/Discover'
 
+function parseDate(value) {
+  if (!value) return null
+  const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value)
+  return Number.isFinite(date.getTime()) ? date : null
+}
+
+function formatDate(value, options) {
+  const date = parseDate(value)
+  return date ? date.toLocaleDateString(undefined, options) : 'Date unavailable'
+}
+
 function CopyButton({ text }) {
   const [done, setDone] = useState(false)
   const copy = async () => {
@@ -409,12 +422,19 @@ function PublishedPaperCard({ paper, onRemove }) {
   return <article className="panel paper-card">
     <div className="paper-card-meta">
       {paper.domain && <span className="paper-card-domain">{paper.domain}</span>}
-      <time dateTime={paper.published_at ?? paper.created_at}>{new Date(paper.published_at ?? paper.reviewed_at ?? paper.created_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}</time>
+      <time dateTime={paper.publication_date ?? paper.published_at ?? paper.created_at}>{(parseDate(paper.publication_date) ?? new Date(paper.published_at ?? paper.reviewed_at ?? paper.created_at)).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}</time>
     </div>
     <h3><Link to={`/articles/${paper.id}`}>{paper.title}</Link></h3>
     {authorNames.length > 0 && <p className="paper-card-authors">{authorNames.join(', ')}</p>}
     <p className="paper-card-abstract">{paper.abstract}</p>
     {tags.length > 0 && <div className="paper-card-tags">{tags.slice(0, 3).map((tag) => <Link key={tag} to={`/articles?tag=${encodeURIComponent(tag)}`}>#{tag}</Link>)}{tags.length > 3 && <span>+{tags.length - 3}</span>}</div>}
+    {paper.matched_interests?.length > 0 && <p className="recommendation-relevance">
+      <strong>Match score: {paper.score}</strong>
+      {' · '}
+      {paper.matched_interests.map(({ interest, signals }) => (
+        <span key={interest}>{interest} ({signals.map(({ field, points }) => `${field} +${points}`).join(', ')})</span>
+      ))}
+    </p>}
     <div className="paper-card-foot">
       <Link className="btn btn-secondary btn-sm" to={`/articles/${paper.id}`}><FilePdf size={15} /> Read paper</Link>
       {paper.doi && <a className="btn btn-ghost btn-sm" href={`https://doi.org/${encodeURIComponent(paper.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ''))}`} target="_blank" rel="noreferrer">DOI</a>}
@@ -443,7 +463,7 @@ export function PaperDetail({ user, onLogout }) {
   if (!paper) return <div className="page"><div className="panel empty" aria-busy="true">Loading paper…</div></div>
   const authors = (paper.authors ?? []).map((author) => typeof author === 'string' ? author : [author.name, author.affiliation].filter(Boolean).join(' · '))
   return <div className="page">
-    <PageHeader title={paper.title} sub={`${paper.domain} · Published ${new Date(paper.published_at ?? paper.reviewed_at ?? paper.created_at).toLocaleDateString()}`} />
+    <PageHeader title={paper.title} sub={`${paper.domain} · Published ${formatDate(paper.publication_date ?? paper.published_at ?? paper.reviewed_at ?? paper.created_at)}`} />
     <article className="panel paper-detail">
       <h2>Authors</h2><p className="article-authors">{(paper.authors ?? []).map((author, i) => (
         <span key={i}>{i > 0 && ', '}{author.user_id ? <Link to={`/users/${author.user_id}`}>{authors[i]}</Link> : authors[i]}</span>
@@ -865,6 +885,7 @@ const makeInitialPaperForm = (user) => ({
   abstract: '',
   doi: '',
   domain: '',
+  publicationDate: '',
   tags: '',
   authors: [{ user_id: user?.id, name: user?.name ?? '', affiliation: user?.institution ?? '', avatar_url: user?.avatar_url ?? null }],
   additionalNotes: '',
@@ -874,7 +895,7 @@ const splitTags = (value) => [...new Set(value.split(',').map((tag) => tag.trim(
 const sameText = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase()
 const SUBMIT_STEPS = [
   { title: 'Upload paper', hint: 'PDF and smart fill', fields: ['pdf'] },
-  { title: 'Paper details', hint: 'Title, abstract, domain', fields: ['title', 'abstract', 'domain', 'doi', 'tags'] },
+  { title: 'Paper details', hint: 'Title, abstract, domain', fields: ['title', 'abstract', 'domain', 'doi', 'publicationDate', 'tags'] },
   { title: 'Authors & submit', hint: 'Co-authors, notes, review', fields: ['authors', 'additionalNotes'] },
 ]
 const DOI_PATTERN = /^10\.\d{4,9}\/[^\s<>]+$/i
@@ -1140,6 +1161,12 @@ function SubmitWizard({ user }) {
     }
     if (want('domain') && !form.domain.trim()) found.domain = 'Enter a research domain or category'
     if (want('doi') && form.doi.trim() && !DOI_PATTERN.test(cleanDoi(form.doi))) found.doi = 'Enter a valid DOI, such as 10.1000/example'
+    if (want('publicationDate') && form.publicationDate) {
+      const date = new Date(`${form.publicationDate}T00:00:00Z`)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(form.publicationDate) || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== form.publicationDate) {
+        found.publicationDate = 'Enter a valid publication date'
+      } else if (date > new Date()) found.publicationDate = 'The publication date cannot be in the future'
+    }
     if (want('tags')) {
       const tags = splitTags(form.tags)
       if (tags.length > 20 || tags.some((tag) => tag.length > 40)) found.tags = 'Use up to 20 keywords, each 40 characters or fewer'
@@ -1205,6 +1232,7 @@ function SubmitWizard({ user }) {
     body.append('abstract', form.abstract.trim())
     body.append('doi', form.doi.trim())
     body.append('domain', form.domain.trim())
+    body.append('publicationDate', form.publicationDate)
     body.append('tags', JSON.stringify(splitTags(form.tags)))
     body.append('authors', JSON.stringify(authors))
     body.append('additionalNotes', form.additionalNotes.trim())
@@ -1432,6 +1460,12 @@ function SubmitWizard({ user }) {
                   <span className="field-hint" id="p-doi-help">{analysis.status === 'done' && !suggestion.doi ? 'No DOI was found in this PDF. Leave it empty if the paper is not published yet.' : 'The Digital Object Identifier, if the paper already has one.'}</span>
                   <span className="field-error" id="p-doi-error">{errors.doi}</span>
                   {suggestion?.doi && !sameText(suggestion.doi, form.doi) && <PdfSuggestion value={suggestion.doi} onUse={() => applySuggestion('doi', suggestion.doi)} />}
+                </div>
+                <div className="field" data-field="publicationDate">
+                  <label htmlFor="p-publication-date">Publication date <span className="muted-sm">(optional)</span></label>
+                  <input id="p-publication-date" type="date" value={form.publicationDate} max={new Date().toISOString().slice(0, 10)} onChange={(e) => update('publicationDate', e.target.value)} aria-invalid={!!errors.publicationDate} aria-describedby="p-publication-date-error p-publication-date-help" />
+                  <span className="field-hint" id="p-publication-date-help">If it already appeared in a journal or conference.</span>
+                  <span className="field-error" id="p-publication-date-error">{errors.publicationDate}</span>
                 </div>
               </div>
 
@@ -1770,13 +1804,14 @@ export function Settings({ user, onUserUpdate, onAccountDeleted }) {
         method: 'PUT',
         body: {
           ...profile,
-          research_interests: typeof profile.research_interests === 'string'
-            ? profile.research_interests.split(',')
-            : profile.research_interests,
-          skills: typeof profile.skills === 'string' ? profile.skills.split(',') : profile.skills,
-          links: profile.links.filter((link) => link.label.trim() || link.url.trim()),
+          research_interests: Array.isArray(profile.research_interests)
+            ? profile.research_interests
+            : profile.research_interests.split(/[,\n]/),
+          skills: Array.isArray(profile.skills) ? profile.skills : profile.skills.split(/[,\n]/),
+          links: profile.links.filter((link) => link.label.trim() && link.url.trim()),
         },
       })
+      setProfile((current) => ({ ...current, ...updated }))
       onUserUpdate(updated)
       setSaved(true)
     } catch (err) {
@@ -2083,6 +2118,34 @@ export function Search({ user, onLogout }) {
   const [postError, setPostError] = useState('')
   const [communityError, setCommunityError] = useState('')
   const [eventError, setEventError] = useState('')
+  const [recommendations, setRecommendations] = useState([])
+  const [recommendationLoading, setRecommendationLoading] = useState(true)
+  const [recommendationError, setRecommendationError] = useState(null)
+  const [recommendationRequest, setRecommendationRequest] = useState(0)
+
+  useEffect(() => {
+    let active = true
+    api('/papers/interest-matches')
+      .then((result) => { if (active) setRecommendations(result) })
+      .catch((err) => {
+        if (!active) return
+        setRecommendationError({
+          message: err.status === 401
+            ? 'Your session may have expired. Sign out and sign in again to view personalized recommendations.'
+            : err.message || 'Recommendations could not be loaded.',
+          status: err.status,
+        })
+      })
+      .finally(() => { if (active) setRecommendationLoading(false) })
+    return () => { active = false }
+  }, [recommendationRequest])
+
+  const refreshRecommendations = () => {
+    setRecommendationLoading(true)
+    setRecommendationError(null)
+    setRecommendationRequest((request) => request + 1)
+  }
+
   useEffect(() => {
     if (!query.trim()) return
     let active = true
@@ -2110,6 +2173,28 @@ export function Search({ user, onLogout }) {
   return (
     <div className="page">
       <PageHeader title={`Results for "${params.get('q') ?? ''}"`} sub={`${total} result${total === 1 ? '' : 's'}`} />
+      <section className="recommendations" aria-labelledby="recommendations-title">
+        <div className="recommendation-heading">
+          <div>
+            <h2 className="section-title" id="recommendations-title">Recommended For You</h2>
+            <p className="recommendation-description">Discover research papers selected based on your interests.</p>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={refreshRecommendations} disabled={recommendationLoading}>
+            {recommendationLoading ? 'Refreshing…' : 'Refresh Recommendations'}
+          </button>
+        </div>
+        {recommendationError && <p className="alert" role="alert">
+          {recommendationError.message}
+          {recommendationError.status ? ` (HTTP ${recommendationError.status})` : ''}
+        </p>}
+        {recommendationLoading
+          ? <p className="muted-sm" role="status">Loading recommendations…</p>
+          : recommendationError
+            ? null
+            : recommendations.length
+              ? <div className="stack">{recommendations.map((paper) => <PublishedPaperCard key={paper.id} paper={paper} />)}</div>
+              : <div className="panel empty"><h3>No recommendations yet</h3><p>No approved papers match your saved interests yet. Add or update interests in Settings, or check back as more papers are approved.</p></div>}
+      </section>
       {paperError && <p className="alert" role="alert">{paperError}</p>}
       {userError && <p className="alert" role="alert">{userError}</p>}
       {postError && <p className="alert" role="alert">{postError}</p>}
