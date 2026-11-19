@@ -5,10 +5,14 @@ import {
   Heart, ChatCircle, SealCheck, CaretDown, Plus, X, Bell, Sun, Moon, Desktop, Trash, UserPlus, BookmarkSimple, DeviceMobile, SignOut,
   MagicWand, CheckCircle, Circle, Warning, MagnifyingGlass, ArrowRight, ArrowLeft, BookOpenText, PenNib,
   Buildings, CalendarBlank, LinkSimple, PencilSimple, UserCircle, Palette, IdentificationCard, LockKey, ShareNetwork, EyeSlash, ArrowCounterClockwise, Question,
+  ChartBar, ChatCenteredDots, ShareFat,
 } from '@phosphor-icons/react'
 import { useTheme } from '../theme'
 import { Avatar, PageHeader } from '../components/ui'
 import PostCard, { PostActions } from '../components/PostCard'
+import { StoryViewer } from '../components/Stories'
+import { BACKGROUNDS } from '../components/story-kit'
+import { ProfileHighlights } from '../components/StoryExtras'
 import { ROLE_LABEL, timeAgo } from '../format'
 import { apa, bibtex } from '../cite'
 import { FAQ } from '../content'
@@ -791,6 +795,8 @@ export function Messages({ user }) {
 const NOTIF_ICON = {
   paper_review: SealCheck, like: Heart, message: ChatCircle, comment: ChatCircle,
   follow: UserPlus, paper_like: Heart, paper_comment: ChatCircle, review_request: SealCheck, coauthor: Users, story_mention: UserCircle, reel_like: Heart, reel_comment: ChatCircle, reel_tag: UserCircle, doc_invite: UserPlus, doc_joined: Users,
+  story_poll_vote: ChartBar, story_question_response: ChatCenteredDots, story_question_answered: ChatCenteredDots, story_quiz_answer: CheckCircle,
+  story_reshare: ShareFat, story_reaction: Heart, story_reply: ChatCircle,
 }
 
 export function Notifications({ user }) {
@@ -820,6 +826,8 @@ export function Notifications({ user }) {
     if (item.entity_type === 'conversation') return `/messages?conversation=${item.entity_id}`
     if (item.kind === 'paper_review') return item.entity_id ? `/my-submissions/${item.entity_id}` : '/my-submissions'
     if (item.kind === 'story_mention') return `/?story=${item.entity_id}`
+    // Story activity (PR #21) points at a story; open the stories of whoever it is about.
+    if (item.kind?.startsWith('story_')) return item.kind === 'story_reshare' || item.kind === 'story_question_answered' ? `/?story=${item.actor_id ?? user.id}` : `/?story=${user.id}`
     if (['reel_like', 'reel_comment', 'reel_tag'].includes(item.kind)) return `/reels?reel=${item.entity_id}`
     if (item.kind === 'doc_invite' || item.kind === 'doc_joined') return '/docs'
     if (item.kind === 'review_request') return `/reviews/${item.entity_id}`
@@ -2355,6 +2363,11 @@ export function UserProfile({ user, onLogout }) {
           <p className="profile-joined"><CalendarBlank size={15} /> Joined {joined}</p>
         </div>
       </section>
+
+      <ProfileHighlights key={profile.id} profile={profile} isMe={isMe} backgrounds={BACKGROUNDS}
+        renderViewer={({ groups, onClose, onDeleted }) => (
+          <StoryViewer me={user} groups={groups} start={0} onClose={onClose} onSeen={() => {}} onDeleted={onDeleted} onAudience={() => {}} />
+        )} />
 
       {missing.length > 0 && (
         <Link to="/settings" className="panel profile-nudge">

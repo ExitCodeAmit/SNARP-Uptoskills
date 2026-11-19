@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Trash, PencilSimple, ThumbsUp, ChatCircle, ShareFat, Flag, BookmarkSimple, X, Eye } from '@phosphor-icons/react'
+import { Trash, PencilSimple, ThumbsUp, ChatCircle, ShareFat, Flag, BookmarkSimple, X, Eye, UsersThree } from '@phosphor-icons/react'
 import { api } from '../api'
 import { Avatar } from './ui'
 import { Overlay } from './Overlay'
@@ -38,6 +38,7 @@ export function PostActions({ post, kind = 'post', viewerId, canModerate, onUpda
   const [reportReason, setReportReason] = useState('')
   const [reportSent, setReportSent] = useState(false)
   const [notice, setNotice] = useState('')
+  const [likers, setLikers] = useState(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -116,6 +117,12 @@ export function PostActions({ post, kind = 'post', viewerId, canModerate, onUpda
     }
   }
 
+  // Who liked a post (PR #21).
+  const openLikers = async () => {
+    setLikers([])
+    try { setLikers(await api(`/posts/${post.id}/likes`)) } catch (err) { setLikers(null); handleError(err) }
+  }
+
   const report = async (event) => {
     event.preventDefault()
     setBusy(true)
@@ -136,6 +143,11 @@ export function PostActions({ post, kind = 'post', viewerId, canModerate, onUpda
         <button className={post.liked_by_me ? 'active' : ''} onClick={toggleLike} aria-pressed={!!post.liked_by_me} disabled={busy} title={post.liked_by_me ? 'Unlike' : 'Like'}>
           <ThumbsUp size={16} weight={post.liked_by_me ? 'fill' : 'regular'} /> {likes} <span className="sr-only">{likes === 1 ? 'like' : 'likes'}</span>
         </button>
+        {kind === 'post' && likes > 0 && (
+          <button className={likers ? 'active-soft' : ''} onClick={openLikers} aria-haspopup="dialog" title="See who liked this">
+            <UsersThree size={16} /> <span className="sr-only">See who liked this</span>
+          </button>
+        )}
         <button className={commentsOpen ? 'active-soft' : ''} onClick={openComments} aria-haspopup="dialog" title="Comments">
           <ChatCircle size={16} /> {commentCount} <span className="sr-only">{commentCount === 1 ? 'comment' : 'comments'}</span>
         </button>
@@ -158,6 +170,29 @@ export function PostActions({ post, kind = 'post', viewerId, canModerate, onUpda
         )}
       </div>
       {error && !commentsOpen && <p className="field-error" role="alert">{error}</p>}
+      {likers && (
+        <Overlay className="comments-sheet" labelledBy={`likes-title-${post.id}`} onClose={() => setLikers(null)}>
+          <span className="comments-grip" aria-hidden="true" />
+          <header className="comments-sheet-head">
+            <h2 id={`likes-title-${post.id}`}>Liked by <span>{likes}</span></h2>
+            <button type="button" className="icon-btn" onClick={() => setLikers(null)} aria-label="Close"><X size={18} /></button>
+          </header>
+          <div className="comments-sheet-list">
+            {likers.map((person) => (
+              <div className="comment-row" key={person.user_id}>
+                <Avatar name={person.name} src={person.avatar_url} size="sm" />
+                <div>
+                  <p className="comment-head">
+                    <Link to={`/users/${person.user_id}`} onClick={() => setLikers(null)}><strong>{person.name}</strong></Link>
+                    <time dateTime={person.created_at}>{timeAgo(person.created_at)}</time>
+                  </p>
+                  {person.role !== 'user' && <p className="muted-sm">{ROLE_LABEL[person.role]}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Overlay>
+      )}
       {commentsOpen && (
         <Overlay className="comments-sheet" labelledBy={`comments-title-${kind}-${post.id}`} onClose={closeComments}>
           <span className="comments-grip" aria-hidden="true" />

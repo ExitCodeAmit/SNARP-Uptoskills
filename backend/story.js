@@ -143,6 +143,11 @@ export function groupStories(rows, viewerId) {
       expires_at: row.expires_at,
       seen: row.seen,
       ...(row.view_count != null ? { view_count: row.view_count } : {}),
+      sticker: row.sticker ?? null,
+      my_reaction: row.my_reaction ?? null,
+      original_story_id: row.original_story_id ?? null,
+      reshared_from: row.reshared_from ?? null,
+      can_reshare: Boolean(row.can_reshare),
     })
   }
   const list = [...groups.values()].map((group) => {

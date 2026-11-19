@@ -2,11 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useSearchParams } from 'react-router-dom'
 import {
-  At, CaretLeft, CaretRight, Check, Eye, Globe, ImageSquare, MagnifyingGlass, PaperPlaneRight, Plus, SpeakerHigh, SpeakerSlash, TextAa, Trash, UsersThree, X,
+  At, CaretLeft, CaretRight, ChartBar, Check, Eye, Globe, ImageSquare, MagnifyingGlass, PaperPlaneRight, Plus, ShareFat, Sparkle, SpeakerHigh, SpeakerSlash, Star, TextAa, Trash, UsersThree, X,
 } from '@phosphor-icons/react'
 import { api } from '../api'
 import { Avatar } from './ui'
 import { timeAgo } from '../format'
+import CloseFriendsModal from './stories/CloseFriendsModal'
+import { AddToHighlight, StickerChip, StickerEditor, StoryActivity, StoryReplyBar, StoryStickers } from './StoryExtras'
+import { attachSticker, BACKGROUNDS, emptySticker, stickerProblem } from './story-kit'
 
 const PHOTO_MS = 6000
 const MAX_IMAGE = 5 * 1024 * 1024
@@ -18,14 +21,6 @@ const MAX_EDGE = 1920
 const IMAGE_TYPES = /^image\/(jpeg|png|gif|webp)$/
 const VIDEO_TYPES = /^video\/(mp4|webm|quicktime)$/
 
-const BACKGROUNDS = {
-  sunset: 'linear-gradient(160deg, #ff9a3c 0%, #ff3b6b 52%, #8b3dff 100%)',
-  ocean: 'linear-gradient(160deg, #3ee0f0 0%, #3b82f6 52%, #4338ca 100%)',
-  forest: 'linear-gradient(160deg, #b6f05c 0%, #10b981 52%, #0f766e 100%)',
-  night: 'linear-gradient(160deg, #475569 0%, #1e293b 55%, #0b1120 100%)',
-  blush: 'linear-gradient(160deg, #fde2f3 0%, #f472b6 52%, #be185d 100%)',
-  gold: 'linear-gradient(160deg, #fff1b8 0%, #f59e0b 52%, #b45309 100%)',
-}
 const BACKGROUND_KEYS = Object.keys(BACKGROUNDS)
 const TEXT_COLORS = ['#ffffff', '#111111', '#ffd60a', '#ff8a1f', '#ff3b6b', '#c084fc', '#3b82f6', '#10d6a0', '#9ca3af']
 const LIGHT_COLORS = new Set(['#ffffff', '#ffd60a', '#10d6a0', '#9ca3af', '#ff8a1f'])
@@ -198,6 +193,7 @@ function MentionPicker({ taken, onPick, onClose }) {
 const AUDIENCES = [
   { key: 'followers', label: 'Followers', icon: Globe, help: 'Everyone who follows you' },
   { key: 'friends', label: 'Friends', icon: UsersThree, help: 'Only followers you follow back' },
+  { key: 'close_friends', label: 'Close friends', icon: Star, help: 'Only people on your close friends list' },
 ]
 
 function StoryComposer({ me, onClose, onShared }) {
@@ -207,6 +203,9 @@ function StoryComposer({ me, onClose, onShared }) {
   const [editing, setEditing] = useState(null)
   const [selected, setSelected] = useState(null)
   const [mentionOpen, setMentionOpen] = useState(false)
+  const [sticker, setSticker] = useState(null)
+  const [stickerOpen, setStickerOpen] = useState(false)
+  const [friendsOpen, setFriendsOpen] = useState(false)
   const [drag, setDrag] = useState(null)
   const [state, setState] = useState({ busy: false, loading: false, error: '' })
   const frameRef = useRef(null)
@@ -236,13 +235,15 @@ function StoryComposer({ me, onClose, onShared }) {
   useEffect(() => {
     const key = (e) => {
       if (e.key !== 'Escape') return
+      if (friendsOpen) return
       if (mentionOpen) setMentionOpen(false)
+      else if (stickerOpen) setStickerOpen(false)
       else if (selected) finish()
       else close()
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
-  }, [mentionOpen, selected, finish, close])
+  }, [mentionOpen, stickerOpen, friendsOpen, selected, finish, close])
 
   const patch = (change) => setLayers((list) => list.map((layer) => (layer.id === selected ? { ...layer, ...change } : layer)))
 
@@ -300,8 +301,9 @@ function StoryComposer({ me, onClose, onShared }) {
   }
 
   const stageClick = (e) => {
-    if (e.target.closest('.story-layer, .story-tool, .story-colors, .story-size, .story-mention-pick, .story-gallery')) return
+    if (e.target.closest('.story-layer, .story-tool, .story-colors, .story-size, .story-mention-pick, .story-gallery, .story-sticker-editor, .story-sticker-chip')) return
     if (mentionOpen) { setMentionOpen(false); return }
+    if (stickerOpen) { setStickerOpen(false); return }
     if (selected) { finish(); return }
     const rect = frameRef.current.getBoundingClientRect()
     addText(clamp((e.clientY - rect.top) / rect.height, 0.12, 0.88))
@@ -370,8 +372,14 @@ function StoryComposer({ me, onClose, onShared }) {
     const overlay = written.map((layer) => (layer.type === 'mention'
       ? { type: 'mention', user_id: layer.user_id, x: layer.x, y: layer.y, color: layer.color, size: layer.size, label: layer.label }
       : { type: 'text', text: layer.text.trim(), x: layer.x, y: layer.y, color: layer.color, size: layer.size, label: layer.label }))
-    if (!media && !overlay.length) {
+    if (!media && !overlay.length && !sticker) {
       setState({ busy: false, loading: false, error: 'Type something, mention a friend or add a photo or video' })
+      return
+    }
+    const problem = stickerProblem(sticker)
+    if (problem) {
+      setStickerOpen(true)
+      setState({ busy: false, loading: false, error: problem })
       return
     }
     setEditing(null)
@@ -389,13 +397,17 @@ function StoryComposer({ me, onClose, onShared }) {
         form.append('media', media.file)
       }
       const result = await api('/stories', { method: 'POST', body: form })
+      if (sticker && result?.items?.[0]) {
+        await attachSticker(result.items[0].id, sticker).catch((err) => { throw Object.assign(new Error(`Your story was shared, but the ${sticker.type} could not be added: ${err.message}`), { shared: true }) })
+      }
       onShared(result?.items?.length ?? 1)
     } catch (err) {
+      if (err.shared) { window.alert(err.message); onShared(1); return }
       setState({ busy: false, loading: false, error: err.status === 404 ? 'Stories are not switched on in the server yet. Restart the SNARP backend and try again.' : err.message })
     }
   }
 
-  const empty = !media && !layers.length
+  const empty = !media && !layers.length && !sticker
   const taken = new Set(layers.filter((layer) => layer.type === 'mention').map((layer) => layer.user_id))
 
   return createPortal(
@@ -435,6 +447,8 @@ function StoryComposer({ me, onClose, onShared }) {
               </> : <>
                 <button type="button" className="story-tool" onClick={() => addText()} aria-label="Add text" title="Add text"><TextAa size={20} weight="bold" /></button>
                 <button type="button" className="story-tool" onClick={() => setMentionOpen(true)} aria-label="Mention a friend" title="Mention a friend"><At size={20} weight="bold" /></button>
+                <button type="button" className={`story-tool ${sticker ? 'active' : ''}`} onClick={() => { setMentionOpen(false); if (!sticker) setSticker(emptySticker('poll')); setStickerOpen(true) }}
+                  aria-label="Add a poll, question or quiz" title="Poll, question or quiz"><ChartBar size={20} weight="bold" /></button>
                 {!media && (
                   <button type="button" className="story-tool story-tool-bg" style={{ '--bg': BACKGROUNDS[background] }} title="Change background" aria-label="Change background"
                     onClick={() => setBackground((key) => BACKGROUND_KEYS[(BACKGROUND_KEYS.indexOf(key) + 1) % BACKGROUND_KEYS.length])} />
@@ -458,7 +472,10 @@ function StoryComposer({ me, onClose, onShared }) {
               </>
             )}
 
-            {!current && !mentionOpen && !drag && (
+            {sticker && !stickerOpen && <StickerChip sticker={sticker} onClick={() => setStickerOpen(true)} />}
+            {stickerOpen && sticker && <StickerEditor sticker={sticker} onChange={(next) => { setSticker(next); if (!next) setStickerOpen(false) }} onClose={() => setStickerOpen(false)} />}
+
+            {!current && !mentionOpen && !stickerOpen && !drag && (
               <button type="button" className="story-gallery" onClick={() => fileRef.current.click()} aria-label="Add a photo or video" title="Photo or video">
                 <ImageSquare size={22} />
                 <span>{media ? 'Change' : 'Photo / video'}</span>
@@ -478,7 +495,7 @@ function StoryComposer({ me, onClose, onShared }) {
         )}
         {state.error && <p className="story-error" role="alert">{state.error}</p>}
         <div className="story-compose-foot">
-          <span className="story-compose-note">Shown for 24 hours. <strong>Your story</strong>: all followers. <strong>Friends</strong>: only followers you follow back.</span>
+          <span className="story-compose-note">Shown for 24 hours. <strong>Your story</strong>: all followers. <strong>Friends</strong>: only followers you follow back. <strong>Close friends</strong>: <button type="button" className="link-btn" onClick={() => setFriendsOpen(true)}>your list</button>.</span>
           <div className="story-share-row">
             <button type="button" className="story-share" onClick={() => share('followers')} disabled={!!state.busy || state.loading} title="Share with everyone who follows you">
               <Avatar name={me.name} src={me.avatar_url} size="sm" />
@@ -489,9 +506,14 @@ function StoryComposer({ me, onClose, onShared }) {
               {state.busy === 'friends' ? 'Sharing…' : 'Friends'}
               <PaperPlaneRight size={16} weight="fill" />
             </button>
+            <button type="button" className="story-share story-share-close" onClick={() => share('close_friends')} disabled={!!state.busy || state.loading} title="Share only with your close friends list">
+              <span className="story-close-dot"><Star size={15} weight="fill" /></span>
+              {state.busy === 'close_friends' ? 'Sharing…' : 'Close friends'}
+            </button>
           </div>
         </div>
       </div>
+      {friendsOpen && <CloseFriendsModal isOpen onClose={() => setFriendsOpen(false)} currentUser={me} />}
     </div>,
     document.body,
   )
@@ -557,6 +579,7 @@ function StoryAudience({ story, onSheet }) {
         </div>
         {story.parts > 1 && <p className="story-sheet-note">Applies to all {story.parts} parts of this video.</p>}
       </section>
+      <StoryActivity story={story} onLeave={onSheet.leave} />
       {error && <p className="story-sheet-error" role="alert">{error}</p>}
       <ul className="story-viewer-list">
         {viewers === null && [0, 1, 2].map((i) => <li key={i} aria-hidden="true"><span className="avatar avatar-sm skeleton" /><span className="skeleton skeleton-line" /></li>)}
@@ -574,11 +597,13 @@ function StoryAudience({ story, onSheet }) {
   )
 }
 
-function StoryViewer({ groups, start, onClose, onSeen, onDeleted, onAudience }) {
+export function StoryViewer({ me, groups, start, onClose, onSeen, onDeleted, onAudience, onReshared }) {
   const [at, setAt] = useState({ group: start, item: 0 })
   const [held, setHeld] = useState(false)
   const [sheet, setSheet] = useState(false)
-  const paused = held || sheet
+  const [typing, setTyping] = useState(false)
+  const [highlight, setHighlight] = useState(false)
+  const paused = held || sheet || typing || highlight
   const [progress, setProgress] = useState(0)
   const [muted, setMuted] = useState(false)
   const group = groups[at.group]
@@ -654,14 +679,15 @@ function StoryViewer({ groups, start, onClose, onSeen, onDeleted, onAudience }) 
 
   useEffect(() => {
     const key = (e) => {
-      if (e.key === 'Escape') { if (sheet) setSheet(false); else onClose() }
-      if (sheet) return
+      if (typing) return
+      if (e.key === 'Escape') { if (sheet) setSheet(false); else if (highlight) setHighlight(false); else onClose() }
+      if (sheet || highlight) return
       if (e.key === 'ArrowRight') next()
       if (e.key === 'ArrowLeft') prev()
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
-  }, [next, prev, onClose, sheet])
+  }, [next, prev, onClose, sheet, highlight, typing])
 
   if (!story) return null
 
@@ -707,27 +733,33 @@ function StoryViewer({ groups, start, onClose, onSeen, onDeleted, onAudience }) 
             <time dateTime={story.created_at}>{timeAgo(story.created_at)}</time>
           </Link>
           {story.audience === 'friends' && <span className="story-friends-badge" title={group.mine ? 'Only followers you follow back can see this' : 'Shared with friends only'}><UsersThree size={13} weight="fill" /> Friends</span>}
+          {story.audience === 'close_friends' && <span className="story-friends-badge story-close-badge" title={group.mine ? 'Only your close friends can see this' : 'You are on their close friends list'}><Star size={13} weight="fill" /> Close friends</span>}
           {story.kind === 'video' && (
             <button type="button" className="story-icon" onClick={() => setMuted((value) => !value)} onPointerDown={(e) => e.stopPropagation()} aria-label={muted ? 'Turn sound on' : 'Mute'}>
               {muted ? <SpeakerSlash size={20} /> : <SpeakerHigh size={20} />}
             </button>
           )}
+          {group.mine && story.audience !== 'close_friends' && <button type="button" className="story-icon" onClick={() => setHighlight(true)} onPointerDown={(e) => e.stopPropagation()} aria-label="Add to highlight" title="Add to highlight"><Sparkle size={20} /></button>}
           {group.mine && <button type="button" className="story-icon" onClick={remove} onPointerDown={(e) => e.stopPropagation()} aria-label="Delete story"><Trash size={20} /></button>}
           <button type="button" className="story-icon" onClick={onClose} onPointerDown={(e) => e.stopPropagation()} aria-label="Close"><X size={22} /></button>
         </header>
+        {story.reshared_from && <p className="story-reshared"><ShareFat size={13} weight="fill" /> Reshared from {story.reshared_from}</p>}
         {story.caption && <p className="story-caption">{story.caption}</p>}
-        {group.mine && !sheet && (
+        {story.sticker && <StoryStickers key={story.id} story={story} mine={group.mine} onPause={setTyping} onResults={() => setSheet(true)} />}
+        {!group.mine && <StoryReplyBar key={story.id} story={story} onPause={setTyping} onReshared={onReshared} />}
+        {group.mine && !sheet && !highlight && (
           <button type="button" className="story-views" onClick={() => setSheet(true)} onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}
             aria-haspopup="dialog" title="See who viewed this and who can see it">
             <Eye size={16} /> {story.view_count ?? 0} {story.view_count === 1 ? 'view' : 'views'}
             <span className="story-views-sep" aria-hidden="true">·</span>
-            {(story.audience ?? 'followers') === 'friends' ? <UsersThree size={15} weight="fill" /> : <Globe size={15} />}
-            {(story.audience ?? 'followers') === 'friends' ? 'Friends' : 'Followers'}
+            {{ friends: <UsersThree size={15} weight="fill" />, close_friends: <Star size={15} weight="fill" /> }[story.audience] ?? <Globe size={15} />}
+            {{ friends: 'Friends', close_friends: 'Close friends' }[story.audience] ?? 'Followers'}
           </button>
         )}
         {group.mine && sheet && (
           <StoryAudience key={story.id} story={story} onSheet={{ close: () => setSheet(false), leave: onClose, changed: onAudience }} />
         )}
+        {group.mine && highlight && me && <AddToHighlight story={story} me={me} onClose={() => setHighlight(false)} />}
         <button type="button" className="story-tap story-tap-prev" onClick={prev} aria-label="Previous story" />
         <button type="button" className="story-tap story-tap-next" onClick={next} aria-label="Next story" />
       </div>
@@ -824,7 +856,7 @@ export default function Stories({ me }) {
       {notice && <p className="stories-notice" role="status">{notice}</p>}
       {composing && <StoryComposer me={me} onClose={() => setComposing(false)} onShared={shared} />}
       {viewing !== null && ordered[viewing] && (
-        <StoryViewer groups={ordered} start={viewing} onClose={() => { setViewing(null) }} onSeen={markSeen} onDeleted={deleted} onAudience={audienceChanged} />
+        <StoryViewer me={me} groups={ordered} start={viewing} onClose={() => { setViewing(null) }} onSeen={markSeen} onDeleted={deleted} onAudience={audienceChanged} onReshared={load} />
       )}
     </section>
   )

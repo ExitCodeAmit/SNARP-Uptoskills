@@ -18,6 +18,8 @@ export function nameProblem(value) {
   if (name.length > 100) return 'Name must be 100 characters or fewer'
   if (CONTROL_CHARS.test(name)) return 'Name contains characters that are not allowed'
   if (!/\p{L}/u.test(name)) return 'Name must contain letters'
+  // Names are shown to everyone, so an email address must not be used as a name (PR #21).
+  if (name.includes('@')) return 'Use your name, not your email address'
   return null
 }
 

@@ -30,6 +30,7 @@ test('email and name rules', () => {
   assert.ok(emailProblem('some one@example.org'))
   assert.equal(nameProblem('Ana Lima'), null)
   assert.ok(nameProblem(' '))
+  assert.ok(nameProblem('raj2@gmail.com'))
   assert.ok(nameProblem('12345'))
   assert.ok(nameProblem('Bad\u0007Name'))
 })

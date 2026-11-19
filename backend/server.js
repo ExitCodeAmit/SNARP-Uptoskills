@@ -14,6 +14,7 @@ import {
   STORY_ACTIVE_LIMIT, STORY_BACKGROUNDS, STORY_IMAGE_MAX_BYTES, STORY_KINDS, STORY_VIDEO_MAX_BYTES, STORY_VIDEO_MAX_SECONDS,
 } from './story.js'
 import { DEFAULT_MAX_PDF_BYTES, isPdf, validatePaperSubmission } from './paper.js'
+import { createStoryRouter, storyAudienceSql } from './stories/routes.js'
 import { analysePdf } from './pdf-analysis.js'
 import { rankRecommendations } from './recommendations.js'
 import { createSessionToken, REMEMBERED_SESSION_SECONDS, TEMPORARY_SESSION_SECONDS, verifySessionToken } from './session.js'
@@ -2491,11 +2492,19 @@ const STORY_SELECT = `SELECT s.id, s.user_id, s.kind, s.audience, s.caption, s.c
     '/api/images/' || s.image_id::text AS image_url, '/api/story-media/' || s.media_id::text AS media_url,
     u.name, CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url,
     EXISTS (SELECT 1 FROM story_views v WHERE v.story_id = s.id AND v.viewer_id = $1) AS seen,
-    CASE WHEN s.user_id = $1 THEN (SELECT count(*)::int FROM story_views v WHERE v.story_id = s.id AND v.viewer_id <> s.user_id) END AS view_count
+    CASE WHEN s.user_id = $1 THEN (SELECT count(*)::int FROM story_views v WHERE v.story_id = s.id AND v.viewer_id <> s.user_id) END AS view_count,
+    CASE WHEN EXISTS (SELECT 1 FROM story_polls x WHERE x.story_id = s.id) THEN 'poll'
+      WHEN EXISTS (SELECT 1 FROM story_questions x WHERE x.story_id = s.id) THEN 'question'
+      WHEN EXISTS (SELECT 1 FROM story_quizzes x WHERE x.story_id = s.id) THEN 'quiz' END AS sticker,
+    (SELECT r.type FROM story_reactions r WHERE r.story_id = s.id AND r.user_id = $1) AS my_reaction,
+    s.original_story_id, (SELECT o.name FROM stories os JOIN users o ON o.id = os.user_id WHERE os.id = s.original_story_id) AS reshared_from,
+    (s.user_id <> $1 AND s.original_story_id IS NULL AND s.audience <> 'close_friends'
+      AND EXISTS (SELECT 1 FROM story_mentions m WHERE m.story_id = s.id AND m.user_id = $1)
+      AND NOT EXISTS (SELECT 1 FROM story_reshares rs WHERE rs.original_story_id = s.id AND rs.reshared_by_user_id = $1)) AS can_reshare
   FROM stories s JOIN users u ON u.id = s.user_id`
-const STORY_VISIBLE = `s.expires_at > now() AND u.blocked_at IS NULL
-  AND (s.user_id = $1 OR (EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = s.user_id)
-    AND (s.audience = 'followers' OR EXISTS (SELECT 1 FROM follows back WHERE back.follower_id = s.user_id AND back.followee_id = $1))))`
+// Followers see 'followers' stories, mutual followers also see 'friends' stories, and people on the
+// owner's close friends list see 'close_friends' stories (see stories/routes.js).
+const STORY_VISIBLE = `s.expires_at > now() AND u.blocked_at IS NULL AND ${storyAudienceSql('s', '$1')}`
 const storyUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: STORY_VIDEO_MAX_BYTES, files: 1, fields: 10, fieldSize: 64 * 1024 } })
 
 app.get('/api/stories', auth, async (req, res) => {
@@ -2512,7 +2521,7 @@ app.post('/api/stories', auth, writeLimiter, (req, res, next) => storyUpload.sin
   const overlay = parseOverlay(req.body?.overlay)
   if (overlay.error) return res.status(400).json({ error: overlay.error, field: 'overlay' })
   const audience = req.body?.audience === undefined || req.body.audience === '' ? 'followers' : String(req.body.audience)
-  if (!['followers', 'friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
+  if (!['followers', 'friends', 'close_friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
 
   let mime = null
   let parts = [null]
@@ -2656,7 +2665,7 @@ app.get('/api/stories/:id/viewers', auth, async (req, res) => {
 app.put('/api/stories/:id/audience', auth, writeLimiter, async (req, res) => {
   if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
   const audience = String(req.body?.audience ?? '')
-  if (!['followers', 'friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
+  if (!['followers', 'friends', 'close_friends'].includes(audience)) return res.status(400).json({ error: 'Choose who can see your story', field: 'audience' })
   const { rows } = await pool.query(
     `UPDATE stories s SET audience = $3
      FROM stories target
@@ -2690,7 +2699,8 @@ app.delete('/api/stories/:id', auth, async (req, res) => {
   if (!/^\d{1,18}$/.test(req.params.id)) return res.status(404).json({ error: 'Story not found' })
   const { rows } = await pool.query(
     `WITH gone AS (DELETE FROM stories WHERE id = $1 AND user_id = $2 RETURNING image_id, media_id),
-     images_gone AS (DELETE FROM images WHERE id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL))
+     images_gone AS (DELETE FROM images i WHERE i.id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL)
+       AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.image_id = i.id AND s.id <> $1))
      SELECT media_id FROM gone`,
     [req.params.id, req.userId]
   )
@@ -2702,8 +2712,12 @@ app.delete('/api/stories/:id', auth, async (req, res) => {
 })
 
 const removeExpiredStories = () => pool.query(
-  `WITH gone AS (DELETE FROM stories WHERE expires_at < now() - interval '1 hour' RETURNING image_id)
-   DELETE FROM images WHERE id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL)`
+  `WITH gone AS (
+     DELETE FROM stories s WHERE s.expires_at < now() - interval '1 hour'
+       AND NOT EXISTS (SELECT 1 FROM story_highlight_items h WHERE h.story_id = s.id)
+     RETURNING s.id, s.image_id)
+   DELETE FROM images i WHERE i.id IN (SELECT image_id FROM gone WHERE image_id IS NOT NULL)
+     AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.image_id = i.id AND s.id NOT IN (SELECT id FROM gone))`
 ).then(() => removeUnusedStoryMedia(pool))
   .catch((err) => log('error', 'story_cleanup_failed', { code: err.code ?? 'unknown' }))
 setInterval(removeExpiredStories, 60 * 60 * 1000).unref()
@@ -3132,6 +3146,22 @@ app.get('/api/posts/:id/comments', auth, async (req, res) => {
        FROM comments c JOIN users u ON u.id = c.user_id
        WHERE c.post_id = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 50
      ) recent_comments ORDER BY created_at, id`,
+    [req.params.id]
+  )
+  res.json(rows)
+})
+
+// Who liked a post (PR #21), newest first.
+app.get('/api/posts/:id/likes', auth, async (req, res) => {
+  if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
+  const post = await pool.query('SELECT 1 FROM posts WHERE id = $1', [req.params.id])
+  if (!post.rows[0]) return res.status(404).json({ error: 'Post not found' })
+  const { rows } = await pool.query(
+    `SELECT l.user_id, l.created_at, u.name, CASE WHEN u.role = 'admin' THEN 'author' ELSE u.role END AS role,
+       CASE WHEN u.profile_image_id IS NULL THEN NULL ELSE '/api/images/' || u.profile_image_id::text END AS avatar_url
+     FROM likes l JOIN users u ON u.id = l.user_id
+     WHERE l.post_id = $1 AND u.blocked_at IS NULL
+     ORDER BY l.created_at DESC LIMIT 200`,
     [req.params.id]
   )
   res.json(rows)
@@ -5048,6 +5078,10 @@ app.delete('/api/citations/:id', auth, async (req, res, next) => {
   }
 });
 
+
+// Story extras from PR #21: close friends, reactions, replies, polls, questions, quizzes, reshares and highlights.
+const storyExtrasLimit = (req, res, next) => (req.method === 'GET' ? next() : auth(req, res, () => writeLimiter(req, res, next)))
+app.use('/api/stories', storyExtrasLimit, createStoryRouter({ pool, auth, isPgId }))
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }))
 
