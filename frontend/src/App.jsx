@@ -20,6 +20,7 @@ import Reels from './Reels'
 import CitationNetwork from './CitationNetwork'
 import Leaderboard from './Leaderboard'
 import { Saved as Collections } from './Saved'
+import ResearcherMatching from './ResearcherMatching'
 
 import {
   Communities,
@@ -163,6 +164,7 @@ function SiteApp() {
             <Route path="/citation-network" element={<CitationNetwork />} />
             <Route path="/leaderboard" element={<Leaderboard />} />
             <Route path="/collections" element={<Collections />} />
+            <Route path="/researchers" element={<ResearcherMatching />} />
             <Route path="/my-submissions" element={<MySubmissions />} />
             <Route path="/my-submissions/:id" element={<SubmissionFeedback user={user} />} />
             <Route path="/reviews" element={<ReviewQueue />} />
