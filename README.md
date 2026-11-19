@@ -1030,3 +1030,24 @@ Remaining roadmap work, following `social_Academic_Research_Platform_Roadmap.doc
 - [ ] Cursor-based feed pagination for consistent pages as new posts arrive
 - [ ] Shared rate-limit storage before running multiple API instances
 - [ ] Forgot password flow
+
+## Contributing to SNARP-Uptoskills
+
+We welcome contributions that improve the platform's functionality, usability, and documentation.
+
+### Contribution Workflow
+
+1. Fork the repository.
+2. Create a new branch for your changes.
+3. Make your changes and test them.
+4. Commit your changes with a clear message.
+5. Push your branch to your fork.
+6. Open a pull request against the original repository.
+
+### Best Practices
+
+- Keep changes focused and easy to review.
+- Follow the existing project structure and coding conventions.
+- Test changes before submitting a pull request.
+- Never commit passwords, API keys, or database credentials.
+- Update documentation when necessary.
