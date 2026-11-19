@@ -1051,3 +1051,7 @@ We welcome contributions that improve the platform's functionality, usability, a
 - Test changes before submitting a pull request.
 - Never commit passwords, API keys, or database credentials.
 - Update documentation when necessary.
+
+## Contributors
+
+- Preethi
