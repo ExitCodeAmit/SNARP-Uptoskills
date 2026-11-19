@@ -7066,3 +7066,100 @@ button.story-views:focus-visible {
   z-index: 30;
   transform: none;
 }
+
+/* ---------- Paper of the Day (feed rail) ---------- */
+.potd .rail-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.potd-star {
+  color: var(--orange);
+}
+
+.potd-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--orange-soft), var(--surface) 70%);
+  color: var(--text);
+  text-decoration: none;
+  transition: box-shadow 0.15s var(--ease);
+}
+
+.potd-card:hover {
+  box-shadow: var(--b-card-hover);
+}
+
+.potd-domain {
+  justify-self: start;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--orange-ink);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.potd-card strong {
+  font-size: 0.9rem;
+  line-height: 1.35;
+}
+
+.potd-card small,
+.potd-stats {
+  color: var(--text-3);
+  font-size: 0.74rem;
+}
+
+.potd-card p {
+  display: -webkit-box;
+  margin: 2px 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  color: var(--text-2);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.potd-past-title {
+  margin: 12px 0 4px;
+  color: var(--text-3);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.potd-past {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.potd-past li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.potd-past a {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.potd-past time {
+  flex: none;
+  color: var(--text-3);
+  font-size: 0.72rem;
+}

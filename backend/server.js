@@ -1586,6 +1586,70 @@ app.get('/api/papers/categories', auth, async (_req, res) => {
   res.json(rows.map(({ domain }) => domain))
 })
 
+// Paper of the Day (PR #23): each day one published paper is featured, picked by the most likes and saves
+// in the last 7 days among papers not featured before. An advisory lock stops two requests picking two papers.
+const FEATURED_COLUMNS = `p.id, p.title, p.abstract, p.authors, p.domain, p.tags, p.doi, p.created_at, p.published_at,
+  history.featured_date, submitter.name AS submitter_name,
+  (SELECT count(*)::int FROM paper_likes l WHERE l.paper_id = p.id) AS like_count,
+  (SELECT count(*)::int FROM paper_saves s WHERE s.paper_id = p.id) AS save_count`
+
+async function getDailyFeaturedPaper(userId) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('snarp-paper-of-the-day'))")
+    const featured = await client.query('SELECT paper_id FROM paper_of_the_day WHERE featured_date = CURRENT_DATE')
+    if (!featured.rows[0]) {
+      const candidate = await client.query(
+        `SELECT p.id FROM papers p
+         WHERE p.status = 'published'
+           AND NOT EXISTS (SELECT 1 FROM paper_of_the_day history WHERE history.paper_id = p.id)
+         ORDER BY
+           (SELECT count(*) FROM paper_likes l WHERE l.paper_id = p.id AND l.created_at >= now() - interval '7 days') +
+           (SELECT count(*) FROM paper_saves s WHERE s.paper_id = p.id AND s.created_at >= now() - interval '7 days') DESC,
+           COALESCE(p.published_at, p.created_at) DESC, p.id ASC
+         LIMIT 1`,
+      )
+      if (candidate.rows[0]) {
+        await client.query('INSERT INTO paper_of_the_day (paper_id, featured_date) VALUES ($1, CURRENT_DATE) ON CONFLICT DO NOTHING', [candidate.rows[0].id])
+      }
+    }
+    const { rows } = await client.query(
+      `SELECT ${FEATURED_COLUMNS},
+         EXISTS (SELECT 1 FROM paper_likes l WHERE l.paper_id = p.id AND l.user_id = $1) AS liked_by_me,
+         EXISTS (SELECT 1 FROM paper_saves s WHERE s.paper_id = p.id AND s.user_id = $1) AS saved_by_me
+       FROM paper_of_the_day history
+       JOIN papers p ON p.id = history.paper_id
+       JOIN users submitter ON submitter.id = p.user_id
+       WHERE history.featured_date = CURRENT_DATE AND p.status = 'published'`,
+      [userId],
+    )
+    await client.query('COMMIT')
+    return rows[0] ?? null
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+app.get('/api/papers/featured', auth, async (req, res) => {
+  res.json(await getDailyFeaturedPaper(req.userId))
+})
+
+app.get('/api/papers/past-picks', auth, async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT ${FEATURED_COLUMNS}
+     FROM paper_of_the_day history
+     JOIN papers p ON p.id = history.paper_id
+     JOIN users submitter ON submitter.id = p.user_id
+     WHERE history.featured_date < CURRENT_DATE AND p.status = 'published'
+     ORDER BY history.featured_date DESC LIMIT 30`,
+  )
+  res.json(rows)
+})
+
 app.get('/api/papers/trending-tags', auth, async (_req, res) => {
   const { rows } = await pool.query(
     `SELECT min(tag) AS tag, count(*)::int AS paper_count

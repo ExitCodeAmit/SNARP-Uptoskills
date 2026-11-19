@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  Image as ImageIcon, X, UserPlus, Article, ArrowUp, ArrowSquareOut, LinkSimple, PencilSimpleLine,
+  Image as ImageIcon, X, UserPlus, Article, Star, ArrowUp, ArrowSquareOut, LinkSimple, PencilSimpleLine,
 } from '@phosphor-icons/react'
 import { api } from './api'
 import { Avatar } from './components/ui'
@@ -71,6 +71,47 @@ function FeedPaper({ paper, viewer, onUpdate, onLogout }) {
       </div>
       <PostActions post={paper} kind="paper" viewerId={viewer.id} canModerate={['admin', 'moderator'].includes(viewer.role)} onUpdate={onUpdate} onLogout={onLogout} />
     </li>
+  )
+}
+
+// Paper of the Day (PR #23): today's featured published paper and earlier picks.
+function PaperOfTheDay() {
+  const [today, setToday] = useState(undefined)
+  const [past, setPast] = useState([])
+  useEffect(() => {
+    let active = true
+    api('/papers/featured').then((paper) => { if (active) setToday(paper) }).catch(() => { if (active) setToday(null) })
+    api('/papers/past-picks').then((list) => { if (active) setPast(list.slice(0, 5)) }).catch(() => {})
+    return () => { active = false }
+  }, [])
+  if (today === undefined) return null
+  const authors = (today?.authors ?? []).map((author) => (typeof author === 'string' ? author : author.name)).filter(Boolean)
+  return (
+    <section className="rail-sec potd" aria-labelledby="rail-potd">
+      <h3 id="rail-potd" className="rail-title"><Star size={16} weight="fill" className="potd-star" /> Paper of the Day</h3>
+      {today ? (
+        <Link to={`/articles/${today.id}`} className="potd-card">
+          {today.domain && <span className="potd-domain">{today.domain}</span>}
+          <strong>{today.title}</strong>
+          {authors.length > 0 && <small>{authors.slice(0, 3).join(', ')}{authors.length > 3 ? ' et al.' : ''}</small>}
+          <p>{today.abstract}</p>
+          <span className="potd-stats">{today.like_count} likes · {today.save_count} saves</span>
+        </Link>
+      ) : <p className="rail-empty">No published papers to feature yet.</p>}
+      {past.length > 0 && (
+        <>
+          <h4 className="potd-past-title">Past picks</h4>
+          <ul className="potd-past">
+            {past.map((paper) => (
+              <li key={paper.id}>
+                <Link to={`/articles/${paper.id}`}>{paper.title}</Link>
+                <time dateTime={paper.featured_date}>{new Date(`${String(paper.featured_date).slice(0, 10)}T00:00:00`).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}</time>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
   )
 }
 
@@ -409,6 +450,7 @@ export default function Feed({ user, onLogout }) {
       </main>
 
       <aside className="rail">
+        <PaperOfTheDay />
         <section className="rail-sec" aria-labelledby="rail-requests">
           <h3 id="rail-requests" className="rail-title">Requests {requests.length > 0 && <span className="rail-count">{requests.length}</span>}</h3>
           {requests.length === 0 && <p className="rail-empty">No new requests. When someone follows you, you can accept them as a contact here.</p>}
