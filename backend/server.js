@@ -30,6 +30,7 @@ import { assistantConfig, loadGuide, selectGuide, splitGuide, streamAnswer, syst
 import { attachCollaborationWebSocket, createCollaborationServer, flushCollaboration } from './collaboration.js'
 import { createDocumentsRouter } from './documents.js'
 import { createMailer, createVerificationToken, hashToken, isTokenShape, passwordResetEmail, RESET_TTL_MINUTES, VERIFICATION_TTL_HOURS, verificationEmail } from './mailer.js'
+import { fileHash, contentHash, extractPdfText, normalizeDoi, checkDuplicate } from './dedup.js'
 
 const FRONTEND_DIST = process.env.FRONTEND_DIST || fileURLToPath(new URL('../frontend/dist/', import.meta.url))
 const SERVE_FRONTEND = process.env.SERVE_FRONTEND !== 'false' && existsSync(join(FRONTEND_DIST, 'index.html'))
@@ -2462,29 +2463,52 @@ app.post('/api/papers/submit', auth, requireAuthor, writeLimiter, paperUpload.si
     throw err
   }
 
-  const inserted = await pool.query(
-    `INSERT INTO papers
-       (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
-        pdf_content_type, pdf_size, additional_notes, idempotency_key, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13)
-     ON CONFLICT (user_id, idempotency_key) DO NOTHING
-     RETURNING id, title, status, created_at`,
-    [
-      req.userId,
-      paper.title,
-      paper.abstract,
-      paper.doi,
-      paper.domain,
-      paper.tags,
-      JSON.stringify(paper.authors),
-      paper.pdfData,
-      paper.filename,
-      paper.pdfSize,
-      paper.additionalNotes,
-      idempotencyKey,
-      paper.authors.length > 1 ? 'coauthor_check' : 'pending',
-    ]
-  )
+  // Duplicate detection: the same PDF file, the same text (normalized) or the same DOI cannot be submitted twice.
+  const fHash = fileHash(paper.pdfData)
+  let cHash = null
+  try {
+    cHash = contentHash(await extractPdfText(paper.pdfData))
+  } catch {
+    return res.status(400).json({ error: 'The uploaded PDF is corrupted, password-protected, or unreadable.', field: 'pdf' })
+  }
+  const duplicate = { status: 409, body: { code: 'DUPLICATE_PAPER', error: 'This research paper has already been submitted to SNARP.', message: 'This research paper has already been submitted to SNARP.' } }
+  const dupCheck = await checkDuplicate(pool, { fileHash: fHash, contentHash: cHash, doi: normalizeDoi(paper.doi) })
+  if (dupCheck.isDuplicate) return res.status(duplicate.status).json(duplicate.body)
+
+  let inserted
+  try {
+    inserted = await pool.query(
+      `INSERT INTO papers
+         (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
+          pdf_content_type, pdf_size, additional_notes, idempotency_key, status, file_hash, content_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12, $13, $14, $15)
+       ON CONFLICT (user_id, idempotency_key) DO NOTHING
+       RETURNING id, title, status, created_at`,
+      [
+        req.userId,
+        paper.title,
+        paper.abstract,
+        paper.doi,
+        paper.domain,
+        paper.tags,
+        JSON.stringify(paper.authors),
+        paper.pdfData,
+        paper.filename,
+        paper.pdfSize,
+        paper.additionalNotes,
+        idempotencyKey,
+        paper.authors.length > 1 ? 'coauthor_check' : 'pending',
+        fHash,
+        cHash,
+      ]
+    )
+  } catch (err) {
+    // A concurrent upload of the same paper hits the unique fingerprint indexes.
+    if (err.code === '23505' && ['papers_file_hash_uniq', 'papers_content_hash_uniq', 'papers_doi_uniq'].includes(err.constraint)) {
+      return res.status(duplicate.status).json(duplicate.body)
+    }
+    throw err
+  }
 
   let result = inserted.rows[0]
   let statusCode = 201

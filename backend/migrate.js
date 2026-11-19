@@ -1,5 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import pg from 'pg'
 
 const MIGRATION_LOCK_SQL = "SELECT pg_advisory_lock(hashtextextended('snarp:schema-migrations', 0))"
 const MIGRATION_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended('snarp:schema-migrations', 0))"
@@ -56,5 +58,19 @@ export async function runMigrations(pool, directory) {
     }
     client.release(unlockError)
     if (unlockError) throw unlockError
+  }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  const DB_NAME = process.env.PGDATABASE || 'snarp'
+  const pool = new pg.Pool({ database: DB_NAME })
+  try {
+    await runMigrations(pool, new URL('./migrations/', import.meta.url))
+    console.log('Migrations completed successfully.')
+  } catch (err) {
+    console.error('Migration failed:', err)
+    process.exit(1)
+  } finally {
+    await pool.end()
   }
 }

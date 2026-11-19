@@ -978,6 +978,7 @@ function SubmitWizard({ user }) {
   const [previewUrl, setPreviewUrl] = useState('')
   const [errors, setErrors] = useState({})
   const [serverError, setServerError] = useState('')
+  const [duplicateError, setDuplicateError] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [submitted, setSubmitted] = useState(null)
   const [dragging, setDragging] = useState(false)
@@ -999,6 +1000,7 @@ function SubmitWizard({ user }) {
     setErrors((current) => ({ ...current, [name]: undefined }))
     setFromPdf((current) => ({ ...current, [name]: false }))
     setServerError('')
+    setDuplicateError(false)
     requestKeyRef.current = null
   }
   const update = (name, value) => {
@@ -1019,6 +1021,7 @@ function SubmitWizard({ user }) {
       authors: current.authors.map((author, i) => i === index ? { ...author, [name]: value } : author),
     }))
     touch('authors')
+    setDuplicateError(false)
   }
 
   const chooseFile = (nextFile) => {
@@ -1028,6 +1031,7 @@ function SubmitWizard({ user }) {
     setAnalysis({ status: 'idle', error: '', result: null, filled: [], snapshot: null, missing: [] })
     setErrors((current) => ({ ...current, pdf: undefined }))
     setServerError('')
+    setDuplicateError(false)
     requestKeyRef.current = null
     if (nextFile.size > MAX_PDF_BYTES) {
       setErrors((current) => ({ ...current, pdf: 'PDF must be 10 MB or smaller' }))
@@ -1224,7 +1228,9 @@ function SubmitWizard({ user }) {
       requestKeyRef.current = null
       window.scrollTo({ top: 0 })
     } catch (error) {
-      if (error.field) {
+      if (error.status === 409 && error.code === 'DUPLICATE_PAPER') {
+        setDuplicateError(true)
+      } else if (error.field) {
         setErrors((current) => ({ ...current, [error.field]: error.message }))
         const owner = SUBMIT_STEPS.findIndex((s) => s.fields.includes(error.field))
         if (owner >= 0) showStep(owner, error.field)
@@ -1240,6 +1246,7 @@ function SubmitWizard({ user }) {
     setSubmitted(null)
     setErrors({})
     setServerError('')
+    setDuplicateError(false)
   }
 
   const suggestion = analysis.result
@@ -1301,6 +1308,12 @@ function SubmitWizard({ user }) {
       </ol>
       <div className="wizard-progress" aria-hidden="true"><i style={{ width: `${((step + (stepComplete[step] ? 1 : 0.5)) / SUBMIT_STEPS.length) * 100}%` }} /></div>
 
+      {duplicateError && (
+        <div className="alert" role="alert">
+          <strong>Duplicate research paper detected</strong>
+          <p style={{ margin: '0.25rem 0 0' }}>This paper has already been submitted to SNARP. Duplicate submissions are not allowed; please check your document and submit a different paper.</p>
+        </div>
+      )}
       {serverError && <p className="alert" role="alert">{serverError}</p>}
 
       <form className="wizard" onSubmit={submit} noValidate>
