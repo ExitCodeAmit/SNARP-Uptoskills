@@ -63,33 +63,147 @@ export function passwordResetEmail({ name, link }) {
   return { subject: 'Reset your SNARP password', text, html }
 }
 
-export function createMailer({ env = process.env, log }) {
-  const url = env.SMTP_URL
-  const host = env.SMTP_HOST
+export const MAIL_PROVIDERS = ['brevo', 'smtp', 'log']
+export const BREVO_SEND_URL = 'https://api.brevo.com/v3/smtp/email'
+const BREVO_ACCOUNT_URL = 'https://api.brevo.com/v3/account'
+const ATTEMPT_TIMEOUT_MS = 10_000
+const RETRY_DELAYS_MS = [1_000, 3_000]
+const TRANSIENT_CODES = new Set(['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'ECONNREFUSED', 'ESOCKET', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE'])
+
+// "SNARP <no-reply@example.org>" -> { name: 'SNARP', email: 'no-reply@example.org' }
+export function parseAddress(value) {
+  const text = String(value ?? '').trim()
+  const match = /^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/.exec(text)
+  if (match) return { name: match[1].trim() || undefined, email: match[2].trim() }
+  return text ? { email: text } : null
+}
+
+// Which provider sends mail: MAIL_PROVIDER when set, otherwise Brevo when its key is set,
+// SMTP when an SMTP server is set, and otherwise none (messages are written to the log).
+export function mailProvider(env = process.env) {
+  const chosen = String(env.MAIL_PROVIDER ?? '').trim().toLowerCase()
+  if (chosen) {
+    if (!MAIL_PROVIDERS.includes(chosen)) throw new Error(`MAIL_PROVIDER must be one of ${MAIL_PROVIDERS.join(', ')}`)
+    return chosen
+  }
+  if (env.BREVO_API_KEY?.trim()) return 'brevo'
+  if (env.SMTP_URL?.trim() || env.SMTP_HOST?.trim()) return 'smtp'
+  return 'log'
+}
+
+// Errors worth another try: timeouts, network failures, rate limits and server errors.
+export function isTransientMailError(err) {
+  if (!err) return false
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true
+  if (TRANSIENT_CODES.has(err.code)) return true
+  // HTTP (Brevo): 429 and 5xx are temporary.
+  const status = Number(err.status)
+  if (status === 429 || (status >= 500 && status < 600)) return true
+  // SMTP: 4xx replies mean "try again later"; 5xx (for example 535, wrong password) are permanent.
+  const reply = Number(err.responseCode)
+  return reply >= 400 && reply < 500
+}
+
+function brevoError(status, body) {
+  const detail = body?.message ? `: ${String(body.message).slice(0, 200)}` : ''
+  return Object.assign(new Error(`Brevo returned ${status}${detail}`), { status, code: body?.code ?? null })
+}
+
+function createBrevoTransport({ env, fetchImpl }) {
+  const apiKey = env.BREVO_API_KEY?.trim()
+  const fallback = parseAddress(env.MAIL_FROM)
+  const sender = {
+    email: env.BREVO_SENDER_EMAIL?.trim() || fallback?.email,
+    name: env.BREVO_SENDER_NAME?.trim() || fallback?.name || 'SNARP',
+  }
+  if (!apiKey || !sender.email) return { ready: false, problem: 'Set BREVO_API_KEY and BREVO_SENDER_EMAIL to send email with Brevo.' }
+  const headers = { 'api-key': apiKey, accept: 'application/json', 'content-type': 'application/json' }
+  return {
+    ready: true,
+    async send({ to, subject, text, html }) {
+      const res = await fetchImpl(BREVO_SEND_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sender, to: [{ email: to }], subject, textContent: text, htmlContent: html }),
+        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+      })
+      if (!res.ok) throw brevoError(res.status, await res.json().catch(() => null))
+      const body = await res.json().catch(() => null)
+      return { id: body?.messageId ?? null }
+    },
+    async verify() {
+      const res = await fetchImpl(BREVO_ACCOUNT_URL, { headers, signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) })
+      if (!res.ok) throw brevoError(res.status, await res.json().catch(() => null))
+    },
+  }
+}
+
+function createSmtpTransport({ env }) {
   const from = env.MAIL_FROM || env.SMTP_USER || 'SNARP <no-reply@localhost>'
+  // Give up on an unreachable server instead of waiting minutes (some hosts block SMTP ports).
+  const timeouts = { connectionTimeout: ATTEMPT_TIMEOUT_MS, greetingTimeout: ATTEMPT_TIMEOUT_MS, socketTimeout: 15_000 }
   let transport = null
-  if (url) {
-    transport = nodemailer.createTransport(url)
-  } else if (host) {
+  if (env.SMTP_URL?.trim()) {
+    transport = nodemailer.createTransport({ url: env.SMTP_URL.trim(), ...timeouts })
+  } else if (env.SMTP_HOST?.trim()) {
     const port = Number.parseInt(env.SMTP_PORT, 10) || 587
     transport = nodemailer.createTransport({
-      host,
+      host: env.SMTP_HOST.trim(),
       port,
       secure: env.SMTP_SECURE ? env.SMTP_SECURE === 'true' : port === 465,
       auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASS } : undefined,
+      ...timeouts,
     })
   }
+  if (!transport) return { ready: false, problem: 'Set SMTP_URL or SMTP_HOST to send email over SMTP.' }
+  return {
+    ready: true,
+    async send({ to, subject, text, html }) {
+      const info = await transport.sendMail({ from, to, subject, text, html })
+      return { id: info?.messageId ?? null }
+    },
+    verify: () => transport.verify(),
+  }
+}
+
+// Sends email through Brevo's HTTPS API (works where SMTP ports are blocked) or SMTP (local
+// development with Gmail). Each attempt times out after 10 seconds; temporary failures are
+// retried twice. Without a provider the message is written to the log instead.
+export function createMailer({ env = process.env, log, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+  const provider = mailProvider(env)
+  const transport = provider === 'brevo' ? createBrevoTransport({ env, fetchImpl })
+    : provider === 'smtp' ? createSmtpTransport({ env })
+      : { ready: false, problem: 'No email provider is set.' }
 
   return {
-    configured: !!transport,
+    provider,
+    configured: transport.ready,
+    problem: transport.ready ? null : transport.problem,
     async send({ to, subject, text, html }) {
-      if (!transport) {
-        log('warn', 'mail_not_sent_smtp_unconfigured', { to, subject, text })
+      if (!transport.ready) {
+        log('warn', 'mail_not_sent_smtp_unconfigured', { provider, to, subject, text })
         return { delivered: false }
       }
-      await transport.sendMail({ from, to, subject, text, html })
-      return { delivered: true }
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          const { id } = await transport.send({ to, subject, text, html })
+          if (attempt > 1) log('info', 'mail_sent_after_retry', { provider, attempt, subject })
+          return { delivered: true, id }
+        } catch (err) {
+          if (attempt > RETRY_DELAYS_MS.length || !isTransientMailError(err)) throw err
+          log('warn', 'mail_send_retry', { provider, attempt, code: err.code ?? null, status: err.status ?? null, message: err.message })
+          await sleep(RETRY_DELAYS_MS[attempt - 1])
+        }
+      }
     },
-    verify: () => transport?.verify(),
+    verify: () => (transport.ready ? transport.verify() : Promise.resolve()),
   }
+}
+
+// Waits for a delivery up to `ms`. Resolves to true or false when it finishes in time, or to null
+// while it is still going (it keeps running in the background; its outcome is logged).
+export function settleWithin(promise, ms) {
+  let timer
+  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms) })
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer))
 }

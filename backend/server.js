@@ -38,7 +38,7 @@ import { generateWithGemini } from './gemini.js'
 import { buildSessionAnswerMessages, buildStandaloneQueryMessages, normalizeChatTitle, parseChatQuestion } from './chatSession.js'
 import { buildPaperAnswerMessages, canAccessPaperForChat } from './paperChat.js'
 import { completeChat, indexPaper, indexPendingPapers, searchExcerpts } from './paper-chat.js'
-import { createMailer, createVerificationToken, hashToken, isTokenShape, passwordResetEmail, RESET_TTL_MINUTES, VERIFICATION_TTL_HOURS, verificationEmail } from './mailer.js'
+import { createMailer, createVerificationToken, hashToken, isTokenShape, passwordResetEmail, RESET_TTL_MINUTES, settleWithin, VERIFICATION_TTL_HOURS, verificationEmail } from './mailer.js'
 import { fileHash, contentHash, extractPdfText, normalizeDoi, checkDuplicate } from './dedup.js'
 
 const FRONTEND_DIST = process.env.FRONTEND_DIST || fileURLToPath(new URL('../frontend/dist/', import.meta.url))
@@ -128,7 +128,10 @@ const pool = await setupDb().catch((err) => {
 })
 
 const app = express()
-const trustProxyConfig = process.env.TRUST_PROXY?.trim()
+// Render (which sets RENDER=true) puts exactly one proxy in front of the app, so its address is
+// replaced by the client's from X-Forwarded-For. An explicit TRUST_PROXY always takes precedence.
+const ON_RENDER = process.env.RENDER === 'true'
+const trustProxyConfig = process.env.TRUST_PROXY?.trim() || (ON_RENDER ? '1' : '')
 if (trustProxyConfig) {
   if (/^(true|false)$/i.test(trustProxyConfig)) {
     throw new Error('TRUST_PROXY must be a hop count or a comma-separated list of trusted proxy IPs/CIDRs, not true/false')
@@ -353,7 +356,9 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
       [name, email, hash, role, REQUIRE_EMAIL_VERIFICATION]
     )
     if (!REQUIRE_EMAIL_VERIFICATION) return res.status(201).json(await issue(rows[0], true, req))
-    const emailSent = await sendVerification(rows[0], req)
+    // Wait a short time for the email; if it is still sending, the account is created anyway and
+    // delivery carries on in the background (email_sent is null). The user can always resend.
+    const emailSent = await settleWithin(sendVerification(rows[0], req), SIGNUP_MAIL_WAIT_MS)
     res.status(201).json({ verification_required: true, email, email_sent: emailSent })
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Log in instead?', field: 'email' })
@@ -395,6 +400,10 @@ app.post('/api/admin/login', loginLimiter, accountLoginLimiter, async (req, res)
   res.json(session)
 })
 
+const SIGNUP_MAIL_WAIT_MS = 8_000
+
+// Stores a new verification link for the user and emails it. Resolves to true when the email was
+// delivered and false when it could not be; never rejects (failures are logged).
 async function sendVerification(user, req) {
   const { token, hash } = createVerificationToken()
   await pool.query('DELETE FROM email_verifications WHERE user_id = $1 AND used_at IS NULL', [user.id])
@@ -407,12 +416,16 @@ async function sendVerification(user, req) {
   const link = `${base}/verify-email?token=${token}`
   try {
     const { delivered } = await mailer.send({ to: user.email, ...verificationEmail({ name: user.name, link }) })
+    if (delivered) log('info', 'verification_email_sent', { userId: user.id, provider: mailer.provider })
     return delivered
   } catch (err) {
-    log('error', 'verification_email_failed', { userId: user.id, message: err.message })
+    log('error', 'verification_email_failed', { userId: user.id, provider: mailer.provider, code: err.code ?? null, status: err.status ?? null, message: err.message })
     return false
   }
 }
+
+// Runs a delivery without making the request wait for it.
+const inBackground = (promise, event, fields) => promise.catch((err) => log('error', event, { ...fields, message: err.message }))
 
 app.post('/api/auth/verify-email', verifyLimiter, async (req, res) => {
   const token = req.body?.token
@@ -462,11 +475,12 @@ app.post('/api/auth/forgot-password', verifyLimiter, resendLimiter, async (req, 
       [hash, user.id, RESET_TTL_MINUTES]
     )
     const base = APP_URL || (IS_PRODUCTION ? `http://localhost:${PORT}` : `${req.protocol}://${req.get('host')}`)
-    try {
-      await mailer.send({ to: user.email, ...passwordResetEmail({ name: user.name, link: `${base}/reset-password?token=${token}` }) })
-    } catch (err) {
-      log('error', 'password_reset_email_failed', { userId: user.id, message: err.message })
-    }
+    // Sent in the background: the reply is the same, and as fast, whether or not the account exists.
+    inBackground(
+      mailer.send({ to: user.email, ...passwordResetEmail({ name: user.name, link: `${base}/reset-password?token=${token}` }) }),
+      'password_reset_email_failed',
+      { userId: user.id, provider: mailer.provider },
+    )
   }
   res.json({ message: 'If an account uses that email, a link to reset the password is on its way. It works for 60 minutes.' })
 })
@@ -524,7 +538,8 @@ app.post('/api/auth/resend-verification', verifyLimiter, resendLimiter, async (r
        AND NOT EXISTS (SELECT 1 FROM email_verifications v WHERE v.user_id = u.id AND v.created_at > now() - interval '60 seconds')`,
       [email]
     )
-    if (rows[0]) await sendVerification(rows[0], req)
+    // Sent in the background so the reply does not wait for (or reveal) the delivery.
+    if (rows[0]) inBackground(sendVerification(rows[0], req), 'verification_email_failed', { userId: rows[0].id })
   }
   res.json({ message: 'If that address has an account waiting for confirmation, a new link is on its way.' })
 })
@@ -5122,13 +5137,17 @@ const server = app.listen(PORT, (err) => {
   if (REQUIRE_EMAIL_VERIFICATION && IS_PRODUCTION && !APP_URL) {
     log('warn', 'app_url_not_set', { message: `Emailed links point to http://localhost:${PORT}. Set APP_URL to the public address of the site.` })
   }
+  if (ON_RENDER && !process.env.TRUST_PROXY?.trim()) log('info', 'trust_proxy_render_default', { hops: 1 })
   if (mailer.configured) {
+    const smtp = mailer.provider === 'smtp'
     mailer.verify()
-      .then(() => log('info', 'smtp_ready', { message: 'SMTP login works; emails will be sent.' }))
-      .catch((err) => log('error', 'smtp_login_failed', { code: err.code ?? null, message: err.message }))
+      .then(() => log('info', smtp ? 'smtp_ready' : 'mail_ready', { provider: mailer.provider, message: smtp ? 'SMTP login works; emails will be sent.' : 'Brevo API key works; emails will be sent.' }))
+      .catch((err) => log('error', smtp ? 'smtp_login_failed' : 'mail_check_failed', { provider: mailer.provider, code: err.code ?? null, status: err.status ?? null, message: err.message }))
+  } else if (mailer.provider !== 'log') {
+    log('error', 'mail_not_configured', { provider: mailer.provider, message: mailer.problem })
   }
   if (REQUIRE_EMAIL_VERIFICATION && !mailer.configured) {
-    log('warn', 'smtp_not_configured', { message: 'Verification emails are written to this log instead of being sent. Set SMTP_URL or SMTP_HOST to send them.' })
+    log('warn', 'smtp_not_configured', { message: 'Verification emails are written to this log instead of being sent. Set BREVO_API_KEY (production) or SMTP_URL (local) to send them.' })
   }
 })
 const docsSocket = attachCollaborationWebSocket(server, collaboration, log)

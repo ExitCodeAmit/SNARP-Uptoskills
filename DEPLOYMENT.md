@@ -26,14 +26,22 @@ Set these environment variables in the deployment platform's secret/configuratio
 | `PGPOOL_MAX` | Per-process PostgreSQL connection limit; budget the sum across all API instances under the database connection limit. Defaults to 10 and accepts 1 to 100. |
 | `JWT_SECRET` | Unique secret of at least 32 bytes from a secret manager; rotate only with a planned session invalidation |
 | `PORT` | Port assigned by the hosting platform, if any |
-| `TRUST_PROXY` | Set only when deployed behind a known reverse proxy; use the exact hop count or trusted proxy IP/CIDRs |
+| `TRUST_PROXY` | Set only when deployed behind a known reverse proxy; use the exact hop count or trusted proxy IP/CIDRs. On Render (which sets `RENDER=true`) it defaults to `1`, as Render recommends |
 | `APP_URL` | Public HTTPS address of the site, for example `https://snarp.example.org`; used in verification links |
-| `SMTP_URL` (or `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`) and `MAIL_FROM` | Outgoing mail for verification emails. Without SMTP, links are written to the server log and nobody receives them |
+| `MAIL_PROVIDER` | `brevo`, `smtp` or `log`. Empty: Brevo when `BREVO_API_KEY` is set, else SMTP when `SMTP_URL`/`SMTP_HOST` is set, else log |
+| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME` | Outgoing mail through Brevo's HTTPS API. Use this on hosts that block SMTP ports (Render's free plan blocks 25, 465 and 587). The sender address must be verified in Brevo |
+| `SMTP_URL` (or `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`) and `MAIL_FROM` | Outgoing mail over SMTP, for example Gmail in local development. Without any provider, links are written to the server log and nobody receives them |
 | `PAPER_MAX_PDF_BYTES` | Optional PDF size limit, at most 10 MiB |
 | `SERVE_FRONTEND` | Leave unset to serve `frontend/dist` from the API; `false` when another host serves the frontend on the same domain |
 | `API_RATE_LIMIT`, `WRITE_RATE_LIMIT` | Optional overrides for the per-IP API limit (default 1500 per 15 minutes) and per-account write limit (default 30 per minute) |
 
 The API itself sends a Content Security Policy and the other security headers, and HSTS when `NODE_ENV=production` and the request arrived over HTTPS (which it can only tell when `TRUST_PROXY` is set correctly). Configure the proxy to terminate HTTPS and forward `X-Forwarded-For` and `X-Forwarded-Proto`. The API and frontend share one origin, so no CORS configuration is needed. Never set `TRUST_PROXY=true`.
+
+### Email delivery
+
+Verification, resend-verification and password-reset emails go through the configured provider. Each attempt times out after 10 seconds and temporary failures (timeouts, network errors, HTTP 429/5xx, SMTP 4xx) are retried twice. Sign-up waits at most 8 seconds for the email; if it is still sending, the account is created, delivery continues in the background, and the user can resend from the "Check your email" screen. Resend and forgot-password reply at once and send in the background. Email verification is never skipped.
+
+At startup the log shows `mail_ready` (Brevo key works) or `smtp_ready`, or `mail_check_failed` / `smtp_login_failed` / `mail_not_configured` with the reason. Failed sends are logged as `verification_email_failed` or `password_reset_email_failed`.
 
 ## 3. Build and start
 

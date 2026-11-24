@@ -5,6 +5,11 @@ const log = () => {}
 const mailer = createMailer({ log })
 
 function hint(err) {
+  if (mailer.provider === 'brevo') {
+    if (Number(err.status) === 401) return 'Brevo rejected the key. Use an API key (SMTP & API > API Keys), not an SMTP key, in BREVO_API_KEY.'
+    if (Number(err.status) === 400) return 'Brevo refused the message. Check that BREVO_SENDER_EMAIL is a sender verified in your Brevo account.'
+    return 'Could not reach Brevo. Check the internet connection and try again.'
+  }
   const text = `${err.code ?? ''} ${err.responseCode ?? ''} ${err.message ?? ''}`
   if (/EAUTH|535|534|Application-specific password|Username and Password not accepted/i.test(text)) {
     return 'The server rejected the user name or password. For Gmail, turn on 2-Step Verification and use a 16-character App Password (https://myaccount.google.com/apppasswords), not your normal password. In SMTP_URL, write the @ of your email as %40.'
@@ -16,10 +21,16 @@ function hint(err) {
   return 'See the message above for details.'
 }
 
-if (!mailer.configured) {
-  console.log(`SMTP is not configured, so emails are only written to the server log.
+if (!mailer.configured && mailer.provider === 'brevo') {
+  console.log(`Brevo is selected but not set up: ${mailer.problem}`)
+  process.exit(1)
+}
 
-Add these lines to backend/.env (Gmail example), then run this again:
+if (!mailer.configured) {
+  console.log(`No email provider is configured, so emails are only written to the server log.
+
+For production (for example on Render), set BREVO_API_KEY and BREVO_SENDER_EMAIL.
+For local development, add these lines to backend/.env (Gmail example), then run this again:
 
   SMTP_URL=smtps://yourname%40gmail.com:your-16-char-app-password@smtp.gmail.com:465
   MAIL_FROM=SNARP <yourname@gmail.com>
@@ -30,7 +41,7 @@ Create the app password at https://myaccount.google.com/apppasswords (needs 2-St
 }
 
 try {
-  process.stdout.write('Checking the SMTP login... ')
+  process.stdout.write(mailer.provider === 'brevo' ? 'Checking the Brevo API key... ' : 'Checking the SMTP login... ')
   await mailer.verify()
   console.log('OK')
 } catch (err) {

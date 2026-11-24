@@ -163,7 +163,8 @@ function CheckEmail({ email, emailSent, onBack, nextQuery }) {
         <h1>Check your email</h1>
         <p>We sent a confirmation link to <strong>{email}</strong>. Open it to activate your account. The link works for 24 hours.</p>
       </header>
-      {!emailSent && (
+      {/* false: delivery failed. null: still sending in the background, which usually arrives shortly. */}
+      {emailSent === false && (
         <p className="auth-help">
           <Info size={16} />
           <span>The email could not be delivered right now. Try resending in a minute. If it still doesn&apos;t arrive, contact the SNARP administrator.</span>
