@@ -299,6 +299,9 @@ button {
 }
 
 .avatar-photo {
+  /* Always square, so portrait photos are cropped into the circle instead of stretching into an oval
+     where the size comes from the container (for example the story rings). */
+  aspect-ratio: 1 / 1;
   object-fit: cover;
 }
 
