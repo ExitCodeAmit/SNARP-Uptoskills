@@ -325,6 +325,72 @@ async function auth(req, res, next) {
   }
 }
 
+async function optionalAuth(req, res, next) {
+  const authorization = req.headers.authorization
+
+  // No token means guest user
+  if (!authorization) return next()
+
+  // If a token is provided, it must be valid
+  const match = authorization.match(/^Bearer\s+(.+)$/i)
+  if (!match) {
+    return res.status(401).json({ error: 'Please log in again' })
+  }
+
+  let payload
+  try {
+    payload = verifySessionToken(match[1].trim(), JWT_SECRET)
+  } catch {
+    return res.status(401).json({ error: 'Please log in again' })
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.role, u.blocked_at,
+         s.revoked_at IS NULL AND s.expires_at > now() AS valid,
+         s.last_seen_at < now() - interval '5 minutes' AS stale
+       FROM auth_sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.id = $1 AND s.user_id = $2`,
+      [payload.jti, payload.sub]
+    )
+
+    if (rows[0]?.blocked_at) {
+      if (rows[0].valid) {
+        await pool.query(
+          'UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL',
+          [payload.sub]
+        )
+      }
+      return res.status(403).json({
+        error: BLOCKED_MESSAGE,
+        code: 'account_blocked'
+      })
+    }
+
+    if (!rows[0]?.valid) {
+      return res.status(401).json({ error: 'Please log in again' })
+    }
+
+    if (rows[0].stale) {
+      pool.query(
+        'UPDATE auth_sessions SET last_seen_at = now() WHERE id = $1',
+        [payload.jti]
+      ).catch((err) =>
+        log('error', 'session_touch_failed', { message: err.message })
+      )
+    }
+
+    req.userId = payload.sub
+    req.sessionId = payload.jti
+    req.userRole = rows[0].role
+
+    return next()
+  } catch (err) {
+    return next(err)
+  }
+}
+
 const requireAuthor = requirePermission('papers.submit', 'Author access required')
 const isModerator = (req) => can(req.userRole, 'papers.moderate')
 const isSuperAdmin = (req) => can(req.userRole, 'admin.access')
@@ -2052,11 +2118,15 @@ app.put('/api/notifications/read-all', auth, async (req, res) => {
   res.json({ updated: rowCount })
 })
 
-app.get('/api/posts', auth, async (req, res) => {
+app.get('/api/posts', optionalAuth, async (req, res) => {
   const page = Math.max(1, Math.min(50000, Number.parseInt(req.query.page, 10) || 1))
   const limit = 20
   const offset = (page - 1) * limit
   const followingOnly = req.query.scope === 'following'
+
+  if (followingOnly && !req.userId) {
+  return res.status(401).json({ error: 'Please log in to view following posts' })
+}
   const { rows } = await pool.query(`
     WITH visible AS (
       SELECT $3::integer AS user_id
@@ -2096,8 +2166,7 @@ app.get('/api/posts', auth, async (req, res) => {
   const hasMore = rows.length > limit
   res.json({ items: rows.slice(0, limit), page, hasMore })
 })
-
-app.get('/api/posts/search', auth, async (req, res) => {
+app.get('/api/posts/search', optionalAuth, async (req, res) => {
   const q = String(req.query.q ?? '').trim().slice(0, 200)
   if (!q) return res.json([])
   const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
@@ -3150,8 +3219,7 @@ app.put('/api/posts/:id/like', auth, async (req, res) => {
   )
   res.json(rows[0])
 })
-
-app.get('/api/posts/:id/comments', auth, async (req, res) => {
+app.get('/api/posts/:id/comments', optionalAuth, async (req, res) => {
   if (!isPgId(req.params.id)) return res.status(404).json({ error: 'Post not found' })
   const { rows } = await pool.query(
     `SELECT * FROM (
